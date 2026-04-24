@@ -1,0 +1,13 @@
+[package]
+name = "chirp"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic procedural notification sounds derived from an input hash"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nickspiker/chirp"
+readme = "README.md"
+keywords = ["audio", "notification", "procedural", "synthesis"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+rodio = { version = "0.22", default-features = false, features = ["playback"] }
