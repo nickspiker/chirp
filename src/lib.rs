@@ -6,7 +6,7 @@
 //! notifications where you want the *kind* of event to be recognizable from
 //! the sound alone, without curating a sound bank.
 //!
-//! `Chirp` implements [`rodio::Source`], so it can be played directly through
+//! `Chirp` implements [`rodio::Source`], so it can be played directly thru
 //! a rodio sink, mixer, or player. See the `play` example.
 
 use std::fmt::Write as _;
