@@ -39,11 +39,9 @@ fn main() {
 
     let duration_ms = samples.len() as f32 / sound::SAMPLE_RATE as f32 * 1000.0;
     println!(
-        "wrote chirp.html — {:.0}ms, {} samples, {:.0}→{:.0} Hz",
+        "wrote chirp.html — {:.0}ms, {} samples",
         duration_ms,
         samples.len(),
-        sound::START_FREQ,
-        sound::END_FREQ,
     );
 
     player.sleep_until_end();

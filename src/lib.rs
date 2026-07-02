@@ -17,48 +17,109 @@ use rodio::{ChannelCount, Sample, SampleRate, Source};
 
 const SAMPLE_RATE_HZ: u32 = 44_100;
 
-/// A deterministic notification chirp.
+/// Chord pitch layers: every voice identity plays all three, at base multipliers 3 : 4 : 5.
+/// The multiplier sits INSIDE the FM term (`x·(P + wobble)`), exactly as in the source formula.
+const PITCHES: [f64; 3] = [3.0, 4.0, 5.0];
+
+/// Number of voice identities. Each identity owns seven randoms shared by all three of its pitch layers, so an identity's three notes detune, phase, shape, and gate together.
+const N_IDENTITIES: usize = 9;
+
+/// One voice identity: seven random parameters in `[-1, 1)`.
+/// r0: FM depth, r1: FM rate, r2: phase offset, r3: waveshaper exponent, r4: waveshaper bias, r5: attack offset, r6: decay-rate stretch.
+#[derive(Clone, Copy)]
+struct Voice {
+    r: [f64; 7],
+}
+
+impl Voice {
+    /// One pitch layer of this identity at plot-space `x` — a verbatim port of the Plotypus formula (one summand of the 27):
+    /// `tanh((sin((x·(P + r0·tanh(x·r1 + 1>>2)>>2) + r2·π)<<10) + 1)^(3+r3) − 2 + r4>>1)`
+    /// `· sqrt(1 − (max(min(½ + x + (r5>>4), 1), 0) − 1)²)`   (quarter-circle attack)
+    /// `· min(0, (x+½)·(r6>>2 + 1) − 1)²`                     (parabolic decay tail)
+    fn sample(&self, pitch: f64, x: f64) -> f64 {
+        let [r0, r1, r2, r3, r4, r5, r6] = self.r;
+
+        // Tone: slow tanh FM inside a sine, pushed thru an odd waveshaper for harmonics.
+        let angle =
+            (x * (pitch + r0 * (x * r1 + 0.25).tanh() * 0.25) + r2 * std::f64::consts::PI) * 1024.0;
+        let tone = ((angle.sin() + 1.0).powf(3.0 + r3) - 2.0 + r4 * 0.5).tanh();
+
+        // Quarter-circle attack: silent below x ≈ -0.5, full by x ≈ 0.5, edge jittered by r5.
+        let t = (0.5 + x + r5 * 0.0625).clamp(0.0, 1.0);
+        let attack = (1.0 - (t - 1.0) * (t - 1.0)).max(0.0).sqrt();
+
+        // Parabolic decay: 1 at x = -0.5, zero once (x+0.5)·(r6/4+1) reaches 1, then silent.
+        let d = ((x + 0.5) * (r6 * 0.25 + 1.0) - 1.0).min(0.0);
+        let tail = d * d;
+
+        tone * attack * tail
+    }
+}
+
+/// A deterministic notification chirp: nine voice identities, each sounding the
+/// 3 : 4 : 5 chord (27 summands), summed and divided by 8 — a verbatim port of the
+/// Plotypus-designed formula. All synthesis runs in `f64`; only the emitted sample is `f32`.
 ///
 /// Construct with [`Chirp::from_hash`] (or [`Chirp::from_bytes`] for arbitrary
 /// input). The struct itself is the audio source: iterate it for raw `f32`
 /// samples, or hand it to rodio for playback.
+#[derive(Clone)]
 pub struct Chirp {
     sample_rate: u32,
     total_samples: u32,
     cursor: u32,
-    start_freq: f32,
-    end_freq: f32,
-    decay: f32,
-    phase: f32,
+    /// Plot-space x at t=0 and its rate of change per second — the voice formula is evaluated in x-space.
+    x_start: f64,
+    x_rate: f64,
+    voices: [Voice; 9],
+    master: f64,
 }
 
 impl Chirp {
     /// Build a chirp deterministically from a 256-bit hash.
     ///
-    /// The hash is sliced into four 32-bit fields that drive the start
-    /// frequency, sweep ratio, duration, and amplitude decay. The mapping is
+    /// The hash folds to a 64-bit seed; every per-voice parameter is an
+    /// independent SplitMix64 expansion of `(seed, index)`. The mapping is
     /// stable across releases that share a major version.
     pub fn from_hash(hash: [u8; 32]) -> Self {
-        let f0_bits = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
-        let f1_bits = u32::from_le_bytes([hash[4], hash[5], hash[6], hash[7]]);
-        let dur_bits = u32::from_le_bytes([hash[8], hash[9], hash[10], hash[11]]);
-        let decay_bits = u32::from_le_bytes([hash[12], hash[13], hash[14], hash[15]]);
+        // Fold the four 64-bit lanes so every hash bit influences the seed.
+        let mut seed = 0u64;
+        for lane in 0..4 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&hash[lane * 8..lane * 8 + 8]);
+            seed ^= u64::from_le_bytes(b).rotate_left(lane as u32 * 17);
+        }
+        // Duration wobbles per hash (0.75-1.05 s).
+        let duration = 0.75 + (mix_unit(seed, 100) * 0.5 + 0.5) * 0.3;
+        Self::from_params([0.0; 7], 1.0, seed, duration)
+    }
 
-        let start_freq = 400.0 + (f0_bits as f32 / u32::MAX as f32) * 1200.0;
-        let ratio = 0.5 + (f1_bits as f32 / u32::MAX as f32) * 1.5;
-        let end_freq = start_freq * ratio;
-        let duration_ms = 80.0 + (dur_bits as f32 / u32::MAX as f32) * 200.0;
-        let total_samples = (SAMPLE_RATE_HZ as f32 * duration_ms / 1000.0) as u32;
-        let decay = 2.0 + (decay_bits as f32 / u32::MAX as f32) * 6.0;
+    /// Build a chirp from explicit voice parameters — the tuning-UI entry point.
+    ///
+    /// `base` is the seven formula knobs (FM depth, FM rate, phase, shape, bias, attack offset, decay stretch), each nominally `-1..1`.
+    /// Every voice identity takes `base[j] + jitter·spread` where jitter is an independent `(seed, identity, param)` hash in `-1..1` — `spread = 0` makes all nine identities share the base values exactly, `spread = 1` with zero base reproduces [`Chirp::from_hash`]'s full-random voicing.
+    /// `duration` is the clip length in seconds; the formula's x domain `-1..1` sweeps over it.
+    pub fn from_params(base: [f64; 7], spread: f64, seed: u64, duration: f64) -> Self {
+        let mut voices = [Voice { r: [0.0; 7] }; N_IDENTITIES];
+        for (k, v) in voices.iter_mut().enumerate() {
+            for (j, r) in v.r.iter_mut().enumerate() {
+                *r = (base[j] + mix_unit(seed, (k * 8 + j) as u64) * spread).clamp(-1.0, 1.0);
+            }
+        }
+
+        let duration = duration.clamp(0.05, 10.0);
+        let total_samples = (SAMPLE_RATE_HZ as f64 * duration) as u32;
 
         Self {
             sample_rate: SAMPLE_RATE_HZ,
             total_samples,
             cursor: 0,
-            start_freq,
-            end_freq,
-            decay,
-            phase: 0.0,
+            // The formula's time domain is x ∈ [-1, 1], swept linearly over the duration.
+            x_start: -1.0,
+            x_rate: 2.0 / duration,
+            voices,
+            // The source formula's final `>>3`.
+            master: 1.0 / 8.0,
         }
     }
 
@@ -69,6 +130,20 @@ impl Chirp {
         Self::from_hash(hash256(bytes))
     }
 
+    /// The instantaneous signal at formula-space `x ∈ [-1, 1]`, clamped to `[-1, 1]`.
+    /// This is the pure function the sample iterator walks — exposed so viewers can
+    /// supersample the waveform at arbitrary x positions (stochastic anti-aliasing).
+    /// Sum of all identities × all pitch layers (27 summands), scaled by the master `>>3`.
+    pub fn signal(&self, x: f64) -> f64 {
+        let mut acc = 0.0f64;
+        for v in &self.voices {
+            for &p in &PITCHES {
+                acc += v.sample(p, x);
+            }
+        }
+        (acc * self.master).clamp(-1.0, 1.0)
+    }
+
     /// Render the complete waveform as an SVG string.
     ///
     /// Every sample is included as a point on a white polyline over a black
@@ -77,6 +152,15 @@ impl Chirp {
         let samples: Vec<f32> = self.collect();
         samples_to_svg(&samples)
     }
+}
+
+/// SplitMix64 of `(seed, idx)` mapped to `[-1, 1)`.
+fn mix_unit(seed: u64, idx: u64) -> f64 {
+    let mut z = seed ^ idx.wrapping_add(1).wrapping_mul(0xD1B5_4A32_D192_ED03);
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
 }
 
 /// Render a slice of `f32` samples as an SVG waveform.
@@ -117,13 +201,10 @@ impl Iterator for Chirp {
         if self.cursor >= self.total_samples {
             return None;
         }
-        let progress = self.cursor as f32 / self.total_samples as f32;
-        let freq = self.start_freq + (self.end_freq - self.start_freq) * progress;
-        let envelope = (-self.decay * progress).exp();
-        let sample = self.phase.sin() * envelope * 0.4;
-        self.phase += 2.0 * std::f32::consts::PI * freq / self.sample_rate as f32;
+        let t = self.cursor as f64 / self.sample_rate as f64;
+        let x = self.x_start + self.x_rate * t;
         self.cursor += 1;
-        Some(sample)
+        Some(self.signal(x) as f32)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -211,6 +292,12 @@ mod tests {
         for s in Chirp::from_hash(HASH_A) {
             assert!(s.abs() <= 1.0, "sample {s} out of range");
         }
+    }
+
+    #[test]
+    fn not_silent() {
+        let peak = Chirp::from_hash(HASH_A).fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.05, "chirp is near-silent (peak {peak})");
     }
 
     #[test]

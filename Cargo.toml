@@ -11,3 +11,16 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 rodio = { version = "0.22", default-features = false, features = ["playback"] }
+
+# The tune viewer (src/bin/tune.rs) is a fluor app for interactively dialing in the voice
+# formula: waveform plot + parameter sliders + play button. Feature-gated so the published
+# crate doesn't drag in the UI stack; run with `cargo run --bin tune --features tune`.
+fluor = { path = "../fluor", features = ["host-winit"], optional = true }
+
+[features]
+tune = ["dep:fluor"]
+
+[[bin]]
+name = "tune"
+path = "src/bin/tune.rs"
+required-features = ["tune"]
