@@ -813,6 +813,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires audio output — run with: cargo test -- --ignored play_audible
+    fn play_audible() {
+        Chirp::from_hash(HASH_A).play_blocking().expect("playback A failed");
+        Chirp::from_hash(HASH_B).play_blocking().expect("playback B failed");
+    }
+
+    #[test]
     fn svg_contains_all_samples() {
         let chirp = Chirp::from_hash(HASH_A);
         let expected_points = chirp.total_samples as usize;
