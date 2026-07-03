@@ -167,7 +167,7 @@ struct Post {
 
 impl Post {
     /// `res_freqs` are the sounding frequencies (Hz) the sympathetic resonators tune to — the bell's lowest partials.
-    fn new(p: PostParams, seed: u64, res_freqs: [f64; 3]) -> Self {
+    fn new(p: PostParams, digest: &[u8; 32], res_freqs: [f64; 3]) -> Self {
         let sr = SAMPLE_RATE_HZ as f64;
 
         let res_g = 0.82 + p.resonance * 0.15;
@@ -179,8 +179,9 @@ impl Post {
         // Echo: 5..30 ms — a tight slapback thickener, not a laggy repeat.
         // Seed-jittered ±5% so no two hashes share a slap time exactly.
         // The comb's first tap emerges at FULL input amplitude, so the audible slap level must be gated by the output gain (echo_gain param), not the comb feedback — feedback only shapes how the trail of repeats decays.
-        let echo_delay =
-            ((0.005 + p.echo_time * 0.025) * (1.0 + mix_unit(seed, 310) * 0.05) * sr) as usize;
+        let echo_delay = ((0.005 + p.echo_time * 0.025)
+            * (1.0 + channel("echo delay jitter", digest) * 0.05)
+            * sr) as usize;
         let echo = Comb::new(echo_delay, p.echo_gain * 0.55);
 
         // Reverb: Freeverb comb tunings scaled by room size, each seed-jittered ±3% (mutually prime-ish lengths keep the tail dense instead of fluttery).
@@ -189,7 +190,7 @@ impl Post {
         let feedback = (0.70 + p.room * 0.28).min(0.98);
         let damp = 0.15 + p.damp * 0.55;
         let combs = std::array::from_fn(|i| {
-            let jitter = 1.0 + mix_unit(seed, 300 + i as u64) * 0.03;
+            let jitter = 1.0 + channel(&format!("reverb comb{i} jitter"), digest) * 0.03;
             DampComb::new((base_delays[i] * scale * jitter) as usize, feedback, damp)
         });
         let aps = [Allpass::new(556, 0.5), Allpass::new(441, 0.5)];
@@ -352,7 +353,8 @@ const CHORD: [f64; 3] = [1.0, 4.0 / 3.0, 1.5];
 
 /// Build one bell's mode set at fundamental `f0`.
 /// `jitter` scales the per-partial randomness (the chime's `spread`: 0 = exact casting, 1 = full individuality).
-fn build_partials(p: &BellParams, f0: f64, seed: u64, jitter: f64) -> Vec<Partial> {
+/// `prefix` namespaces this bell's channels (e.g. "bell0 "), so the three castings draw independent jitters from one digest.
+fn build_partials(p: &BellParams, f0: f64, prefix: &str, digest: &[u8; 32], jitter: f64) -> Vec<Partial> {
     let tau0 = 0.02 * (p.decay.clamp(0.0, 1.0) * 2.5).exp(); // 0.02..0.24 s — the dry ring (4τ) tops out around a second
     let alpha = 0.3 + p.slope.clamp(0.0, 1.0) * 1.7;
     let tilt = 1.6 - p.strike.clamp(0.0, 1.0) * 1.2; // hard strike flattens the spectrum
@@ -361,9 +363,9 @@ fn build_partials(p: &BellParams, f0: f64, seed: u64, jitter: f64) -> Vec<Partia
 
     let mut partials = Vec::with_capacity(n_partials + 1);
     for k in 0..n_partials {
-        let jf = 1.0 + mix_unit(seed, 500 + k as u64) * 0.003 * jitter;
-        let jt = 1.0 + mix_unit(seed, 520 + k as u64) * 0.25 * jitter;
-        let ja = 1.0 + mix_unit(seed, 540 + k as u64) * 0.2 * jitter;
+        let jf = 1.0 + channel(&format!("{prefix}partial{k} freq"), digest) * 0.003 * jitter;
+        let jt = 1.0 + channel(&format!("{prefix}partial{k} tau"), digest) * 0.25 * jitter;
+        let ja = 1.0 + channel(&format!("{prefix}partial{k} amp"), digest) * 0.2 * jitter;
         let ratio = material_ratio(p.material, k).powf(stretch) * jf;
         let freq = f0 * ratio;
         // Nyquist guard: partials that would alias are dropped, not folded.
@@ -371,7 +373,10 @@ fn build_partials(p: &BellParams, f0: f64, seed: u64, jitter: f64) -> Vec<Partia
             continue;
         }
         // Warble: beating twin up to ~5 cents (0.3% of the partial), seed-signed so pairs drift both ways.
-        let det = p.shimmer.clamp(0.0, 1.0) * freq * 0.003 * mix_unit(seed, 560 + k as u64);
+        let det = p.shimmer.clamp(0.0, 1.0)
+            * freq
+            * 0.003
+            * channel(&format!("{prefix}partial{k} warble"), digest);
         partials.push(Partial {
             freq,
             amp: ja / ratio.max(0.4).powf(tilt),
@@ -392,56 +397,50 @@ fn build_partials(p: &BellParams, f0: f64, seed: u64, jitter: f64) -> Vec<Partia
 }
 
 impl Chirp {
-    /// Build a chime deterministically from a 256-bit hash: bells, harmony, timing, and room all derive from the seed.
+    /// Build a chime deterministically from a 32-byte digest (e.g. `spaghettify(theirs ‖ mine)`): bells, harmony, timing, and room all derive from named blake3 channels of it.
     pub fn from_hash(hash: [u8; 32]) -> Self {
-        let mut seed = 0u64;
-        for lane in 0..4 {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&hash[lane * 8..lane * 8 + 8]);
-            seed ^= u64::from_le_bytes(b).rotate_left(lane as u32 * 17);
-        }
-        let u = |idx: u64| mix_unit(seed, idx) * 0.5 + 0.5;
+        let u = |name: &str| channel_unit(name, &hash);
         // Desk-bell ranges: small, bright, short.
         // Ranges from the ear-derived 29-keeper tuning session: decay and room under 0.5; everything else survived full-range listening.
         let bell = BellParams {
-            pitch: u(100),
-            material: u(101),
-            decay: u(102) * 0.5,
-            slope: u(103),
-            strike: u(104),
-            inharm: u(105),
-            shimmer: u(106),
-            partials: u(107),
-            clank: u(108),
-            hum: u(109),
+            pitch: u("pitch"),
+            material: u("material"),
+            decay: u("decay") * 0.5,
+            slope: u("slope"),
+            strike: u("strike"),
+            inharm: u("inharm"),
+            shimmer: u("shimmer"),
+            partials: u("partials"),
+            clank: u("clank"),
+            hum: u("hum"),
         };
         let chime = ChimeParams {
-            spacing: 0.3 + u(111) * 0.7,
-            spread: 0.3 + u(112) * 0.6,
+            spacing: 0.3 + u("chime spacing") * 0.7,
+            spread: 0.3 + u("chime spread") * 0.6,
         };
         // Small mostly-dry room: enough ambiance to place the chime in space without haunting it.
         let post = PostParams {
-            room: u(400) * 0.5,
-            damp: u(401),
-            echo_time: u(402),
-            echo_gain: u(403) * 0.2,
-            resonance: u(404) * 0.25,
-            wet: 0.06 + u(405) * 0.16,
+            room: u("room size") * 0.5,
+            damp: u("room damp"),
+            echo_time: u("echo time"),
+            echo_gain: u("echo gain") * 0.2,
+            resonance: u("resonance") * 0.25,
+            wet: 0.06 + u("wet") * 0.16,
         };
-        Self::from_chime(bell, chime, seed).with_post(post, seed)
+        Self::from_chime(bell, chime, &hash).with_post(post, &hash)
     }
 
     /// Build a single bell (a chime with zero spacing and one strike) — kept for API symmetry and quick tests.
-    pub fn from_bell(p: BellParams, seed: u64) -> Self {
-        Self::from_chime(p, ChimeParams { spacing: 0.0, spread: 0.0 }, seed)
+    pub fn from_bell(p: BellParams, digest: &[u8; 32]) -> Self {
+        Self::from_chime(p, ChimeParams { spacing: 0.0, spread: 0.0 }, digest)
     }
 
     /// Build a three-bell chime from explicit macro knobs — the tuning-UI entry point.
     ///
     /// Locked across the three bells: material, damping slope, mallet (strike + clank), inharmonic stretch, partial count, shimmer amount — the instrument identity.
-    /// Broken apart per bell: pitch (chord ratios off the root), strike time (spacing × order), jitter seed (each bell its own casting, scaled by `spread`), decay (higher bell rings shorter, physics), and level (root slightly louder, ±4% human jitter).
+    /// Broken apart per bell: pitch (chord ratios off the root), strike time (spacing × order), channel namespace (each bell its own casting, scaled by `spread`), decay (higher bell rings shorter, physics), and level (root slightly louder, ±4% human jitter).
     /// The root fundamental maps to 1024..2048 Hz — desk bell, not church tower.
-    pub fn from_chime(p: BellParams, c: ChimeParams, seed: u64) -> Self {
+    pub fn from_chime(p: BellParams, c: ChimeParams, digest: &[u8; 32]) -> Self {
         let f_root = 1024.0 * 2.0f64.powf(p.pitch.clamp(0.0, 1.0)); // 1024..2048 Hz
         // Strike scatter: each bell draws an independent offset in ±(spacing × 20 ms) — near-simultaneous flam, any order.
         let window = c.spacing.clamp(0.0, 1.0) * 0.020;
@@ -449,17 +448,17 @@ impl Chirp {
         let mut strikes = Vec::with_capacity(3);
         for k in 0..3 {
             let ratio = CHORD[k];
-            // Each bell is its own casting: an independent jitter seed, individuality scaled by spread.
-            let bell_seed = seed ^ (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let mut partials = build_partials(&p, f_root * ratio, bell_seed, c.spread);
+            // Each bell is its own casting: its channel names are prefixed "bell{k} ", so the three draw independent jitters from the one digest.
+            let bp = format!("bell{k} ");
+            let mut partials = build_partials(&p, f_root * ratio, &bp, digest, c.spread);
             // Physics: the higher (smaller) bell rings shorter. Scale every mode's tau down by the chord ratio.
             let tau_scale = 1.0 / ratio.powf(0.75);
             for q in &mut partials {
                 q.tau *= tau_scale;
             }
             // Level: root a touch louder than the harmony bells, ±4% per-strike human jitter.
-            let level =
-                (1.0 / ratio.powf(0.3)) * (1.0 + mix_unit(bell_seed, 600) * 0.04);
+            let level = (1.0 / ratio.powf(0.3))
+                * (1.0 + channel(&format!("{bp}level"), digest) * 0.04);
             // Each bell's sawtooth gate runs over its OWN sounding life with its OWN randoms — the three chop patterns interleave instead of one gate slicing the mix.
             let saw_life = partials
                 .iter()
@@ -468,15 +467,15 @@ impl Chirp {
                 .max(0.01)
                 * 4.0;
             strikes.push(Strike {
-                offset: mix_unit(bell_seed, 610) * window,
+                offset: channel(&format!("{bp}offset"), digest) * window,
                 partials,
                 level,
                 clank: p.clank.clamp(0.0, 1.0),
-                clank_seed: bell_seed,
+                clank_seed: channel_u64(&format!("{bp}clank noise"), digest),
                 saw: [
-                    mix_unit(bell_seed, 800),
-                    mix_unit(bell_seed, 801),
-                    mix_unit(bell_seed, 802),
+                    channel(&format!("{bp}saw rate"), digest),
+                    channel(&format!("{bp}saw phase"), digest),
+                    channel(&format!("{bp}saw duty"), digest),
                 ],
                 saw_life,
             });
@@ -520,8 +519,8 @@ impl Chirp {
     }
 
     /// Install the deterministic post chain (resonators + echo + reverb) and extend the clip so the room tail rings out instead of being chopped at the dry end.
-    /// `seed` jitters the comb/echo delays so distinct hashes get audibly distinct rooms; equal (params, seed) is bit-identical.
-    pub fn with_post(mut self, params: PostParams, seed: u64) -> Self {
+    /// `digest` jitters the comb/echo delays (named channels) so distinct digests get audibly distinct rooms; equal (params, digest) is bit-identical.
+    pub fn with_post(mut self, params: PostParams, digest: &[u8; 32]) -> Self {
         // Tail length scales with how live the room is, capped at ~0.9 s so dry + tail stays inside 2 s total.
         let tail_secs = (0.15
             + params.wet * (0.5 + params.room * 1.2)
@@ -529,7 +528,7 @@ impl Chirp {
             + params.resonance * 0.3)
             .min(0.9);
         self.total_samples = self.dry_samples + (SAMPLE_RATE_HZ as f64 * tail_secs) as u32;
-        self.post = Some(Post::new(params, seed, self.res_freqs));
+        self.post = Some(Post::new(params, digest, self.res_freqs));
         self.finalize()
     }
 
@@ -638,7 +637,30 @@ impl Chirp {
     }
 }
 
-/// SplitMix64 of `(seed, idx)` mapped to `[-1, 1)`.
+/// One deterministic aesthetic channel from a 32-byte relationship digest: `blake3(name ‖ digest)`, first 8 bytes as i64, divided by `i64::MIN`.
+/// Range `(-1, +1]` with ±1 actually reachable (i64::MIN is the one value whose magnitude is exactly 2^63).
+/// Distinct names = statistically independent channels — the name IS the domain separation, so add channels freely (colour, haptics, …) without a registry.
+pub fn channel(name: &str, digest: &[u8; 32]) -> f64 {
+    channel_u64(name, digest) as i64 as f64 / i64::MIN as f64
+}
+
+/// Right-handed unipolar variant: same derivation, u64 divided by u64::MAX → `[0, 1]`.
+pub fn channel_unit(name: &str, digest: &[u8; 32]) -> f64 {
+    channel_u64(name, digest) as f64 / u64::MAX as f64
+}
+
+/// Raw 64-bit channel value (the first quarter of `blake3(name ‖ digest)`) — for seeding per-sample noise streams.
+pub fn channel_u64(name: &str, digest: &[u8; 32]) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(name.as_bytes());
+    h.update(digest);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(out)
+}
+
+/// SplitMix64 of `(seed, idx)` mapped to `[-1, 1)` — the per-sample NOISE STREAM generator (hammer clank).
+/// Parameters use the named blake3 [`channel`]s; this stays for streams where one blake3 per sample would be silly. Seed it from [`channel_u64`].
 fn mix_unit(seed: u64, idx: u64) -> f64 {
     let mut z = seed ^ idx.wrapping_add(1).wrapping_mul(0xD1B5_4A32_D192_ED03);
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);

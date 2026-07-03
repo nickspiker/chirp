@@ -53,8 +53,8 @@ const ZERO_LINE:    u32 = 0xFF00_0000 | (0x0040_4040 ^ 0x00FF_FFFF);
 const ZERO_FILL:    u32 = 0xFF00_0000 | (0x0000_E0_00 ^ 0x00FF_FFFF); // green — exact-zero samples, plotypus convention
 const LABEL_COLOUR: u32 = 0xFF00_0000 | (0x00C0_C0C0 ^ 0x00FF_FFFF);
 
-/// Seed for the per-partial jitter + room comb jitter — fixed while dialing knobs so the instrument holds still; `n` rerolls it.
-const BASE_SEED: u64 = 0xBE11_ACC0_5EED_0001;
+/// Digest source for the per-partial jitter + room comb channels — fixed while dialing knobs so the instrument holds still; `n` rerolls it (digest = blake3(digest)).
+const BASE_DIGEST_INPUT: &[u8] = b"bell tune base digest";
 
 struct TuneApp {
     title: String,
@@ -71,8 +71,8 @@ struct TuneApp {
     /// Rendered clip for the current knobs — the plot source and the play buffer.
     samples: Vec<f32>,
     samples_dirty: bool,
-    /// Jitter seed for partials + room combs; `n` rerolls it.
-    seed: u64,
+    /// Jitter digest for partials + room comb channels; `n` rerolls it (blake3 of itself).
+    digest: [u8; 32],
 
     plot_rect: (usize, usize, usize, usize),
     slider_area_top: Coord,
@@ -116,7 +116,7 @@ impl TuneApp {
             modifiers: fluor::event::ModifiersState::default(),
             samples: Vec::new(),
             samples_dirty: true,
-            seed: BASE_SEED,
+            digest: *blake3::hash(BASE_DIGEST_INPUT).as_bytes(),
             plot_rect: (0, 0, 0, 0),
             slider_area_top: 0.0,
             row_pitch: 0.0,
@@ -150,7 +150,8 @@ impl TuneApp {
             resonance: v(16),
             wet: v(17),
         };
-        let synth = chirp::Chirp::from_chime(bell, chime, self.seed).with_post(post, self.seed);
+        let synth =
+            chirp::Chirp::from_chime(bell, chime, &self.digest).with_post(post, &self.digest);
         self.samples = synth.collect();
         self.samples_dirty = false;
     }
@@ -306,13 +307,10 @@ impl TuneApp {
             self.play();
             return EventResponse::Handled;
         }
-        // `n` = reroll the jitter seed: same knobs, sibling instrument.
+        // `n` = reroll the jitter digest: same knobs, sibling instrument.
         if let Key::Character(c) = &kev.logical_key {
             if c.eq_ignore_ascii_case("n") {
-                self.seed = self
-                    .seed
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    .wrapping_add(0xD1B5_4A32_D192_ED03);
+                self.digest = *blake3::hash(&self.digest).as_bytes();
                 self.samples_dirty = true;
                 ctx.window.request_redraw();
                 return EventResponse::Handled;
@@ -325,9 +323,11 @@ impl TuneApp {
                     v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(9)
                 );
                 println!("ChimeParams {{ spacing: {:.3}, spread: {:.3} }}", v(10), v(11));
+                let digest_hex: String =
+                    self.digest.iter().map(|b| format!("{b:02x}")).collect();
                 println!(
-                    "PostParams {{ room: {:.3}, damp: {:.3}, echo_time: {:.3}, echo_gain: {:.3}, resonance: {:.3}, wet: {:.3} }}  seed: {:#018x}",
-                    v(12), v(13), v(14), v(15), v(16), v(17), self.seed
+                    "PostParams {{ room: {:.3}, damp: {:.3}, echo_time: {:.3}, echo_gain: {:.3}, resonance: {:.3}, wet: {:.3} }}  digest: {digest_hex}",
+                    v(12), v(13), v(14), v(15), v(16), v(17)
                 );
                 return EventResponse::Handled;
             }

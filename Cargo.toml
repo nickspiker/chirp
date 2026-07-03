@@ -11,6 +11,8 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 rodio = { version = "0.22", default-features = false, features = ["playback"] }
+# Named-channel derivation: every aesthetic parameter is blake3(channel_name ‖ digest) — see lib.rs channel().
+blake3 = "1"
 
 # The tune viewer (src/bin/tune.rs) is a fluor app for interactively dialing in the voice
 # formula: waveform plot + parameter sliders + play button. Feature-gated so the published
