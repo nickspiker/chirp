@@ -258,6 +258,10 @@ struct Strike {
     /// Hammer noise burst: amplitude, and the seed the per-sample noise hashes from.
     clank: f64,
     clank_seed: u64,
+    /// This bell's sawtooth-gate randoms `[r0, r1, r2]` in `-1..1` (rate stretch, phase offset, duty bias).
+    saw: [f64; 3],
+    /// This bell's sounding life in seconds (4τ of its slowest mode) — the gate's x runs 0..1 over it.
+    saw_life: f64,
 }
 
 impl Strike {
@@ -291,7 +295,14 @@ impl Strike {
             let n = (t * SAMPLE_RATE_HZ as f64) as u64;
             acc += mix_unit(self.clank_seed, 700 + n) * self.clank * 0.8 * (-t / 0.004).exp();
         }
-        acc * self.level
+        // Per-bell sawtooth gate, x ∈ 0..1 over THIS bell's sounding life (the formula's own +1 shifts the exponent to 4..8):
+        // (tanh(sin(2^((x·(1+r0/4) + 1 + r1/16)·4))·4 + r2·2) + 1)/2
+        // sin of an exponentially growing phase = accelerating gate cycles; ×4 into tanh saturates them square (digital chop); r2 biases the duty toward open or shut.
+        let [s0, s1, s2] = self.saw;
+        let x = t / self.saw_life;
+        let phase = 2.0f64.powf((x * (1.0 + s0 * 0.25) + 1.0 + s1 * 0.0625) * 4.0);
+        let env = ((phase.sin() * 4.0 + s2 * 2.0).tanh() + 1.0) * 0.5;
+        acc * self.level * env
     }
 }
 
@@ -449,12 +460,25 @@ impl Chirp {
             // Level: root a touch louder than the harmony bells, ±4% per-strike human jitter.
             let level =
                 (1.0 / ratio.powf(0.3)) * (1.0 + mix_unit(bell_seed, 600) * 0.04);
+            // Each bell's sawtooth gate runs over its OWN sounding life with its OWN randoms — the three chop patterns interleave instead of one gate slicing the mix.
+            let saw_life = partials
+                .iter()
+                .map(|q| q.tau)
+                .fold(0.0f64, f64::max)
+                .max(0.01)
+                * 4.0;
             strikes.push(Strike {
                 offset: mix_unit(bell_seed, 610) * window,
                 partials,
                 level,
                 clank: p.clank.clamp(0.0, 1.0),
                 clank_seed: bell_seed,
+                saw: [
+                    mix_unit(bell_seed, 800),
+                    mix_unit(bell_seed, 801),
+                    mix_unit(bell_seed, 802),
+                ],
+                saw_life,
             });
         }
         // Shift so the earliest strike lands at t = 0 (offsets were drawn in ±window).
@@ -552,6 +576,11 @@ impl Chirp {
             for s in &mut raw {
                 *s *= scale;
             }
+        }
+
+        // Soft saturation: √(1 − x²/2)·x·√2 — naturally odd (the bare x carries the sign), monotonic on -1..1, and maps ±1 → ±1 EXACTLY (√(1/2)·√2 = 1), so no re-normalize is needed. Slope √2 at zero: a gentle knee.
+        for s in &mut raw {
+            *s = (1.0 - *s * *s * 0.5).sqrt() * *s * std::f64::consts::SQRT_2;
         }
 
         // -60 dB threshold relative to the (now unit) peak.

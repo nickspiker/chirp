@@ -257,6 +257,9 @@ impl TuneApp {
                 self.sliders[i].set_value(v);
             }
             self.poll_slider_changes();
+            // Audition immediately — no separate play press per roll.
+            self.rebuild_samples();
+            self.play();
             ctx.window.request_redraw();
         }
         if self.play_button.take_click() {
