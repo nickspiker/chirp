@@ -614,6 +614,28 @@ impl Chirp {
         let samples: Vec<f32> = self.collect();
         samples_to_svg(&samples)
     }
+
+    /// Play on the default output device, blocking until the clip finishes.
+    pub fn play_blocking(self) -> Result<(), String> {
+        let mut sink = rodio::DeviceSinkBuilder::open_default_sink()
+            .map_err(|e| format!("no default audio output device: {e}"))?;
+        // Dropping the sink after playback is deliberate; silence rodio's drop warning.
+        sink.log_on_drop(false);
+        let player = rodio::Player::connect_new(&sink.mixer());
+        player.append(self);
+        player.sleep_until_end();
+        Ok(())
+    }
+
+    /// Fire-and-forget playback on a detached thread — the notification-app entry point.
+    /// Errors (e.g. no audio device) are logged to stderr, never fatal: a missing sound card must not take the host app down.
+    pub fn play_detached(self) {
+        std::thread::spawn(move || {
+            if let Err(e) = self.play_blocking() {
+                eprintln!("chirp: {e}");
+            }
+        });
+    }
 }
 
 /// SplitMix64 of `(seed, idx)` mapped to `[-1, 1)`.
