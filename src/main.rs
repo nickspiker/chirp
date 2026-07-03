@@ -8,7 +8,9 @@ fn main() {
     let samples = sound::samples();
 
     // Play it.
-    let handle = DeviceSinkBuilder::open_default_sink().expect("open default audio device");
+    let mut handle = DeviceSinkBuilder::open_default_sink().expect("open default audio device");
+    // We drop the sink deliberately at process exit; silence rodio's drop warning.
+    handle.log_on_drop(false);
     let player = Player::connect_new(&handle.mixer());
     let buf = rodio::buffer::SamplesBuffer::new(
         NonZero::new(1).unwrap(),

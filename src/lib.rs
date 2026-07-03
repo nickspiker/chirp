@@ -1,10 +1,18 @@
-//! Deterministic procedural notification sounds.
+//! Deterministic procedural notification sounds — a struck metal bell, synthesized modally.
 //!
 //! A [`Chirp`] is a short audio source synthesized from a 256-bit hash. Equal
 //! hashes always produce the same chirp; different hashes produce audibly
 //! distinct ones. The crate is intended for things like per-event UI
 //! notifications where you want the *kind* of event to be recognizable from
 //! the sound alone, without curating a sound bank.
+//!
+//! **Synthesis model: modal.** A struck bell/bar/glass is a small set of exponentially
+//! decaying sine partials: `y(t) = Σ aₖ·sin(2π·fₖ·t)·exp(−t/τₖ)`. The partial frequency
+//! ratios come from measured material tables (bar / church bell / glass, morphable),
+//! decay times fall with frequency (highs die first — the strongest "struck metal" cue),
+//! amplitudes tilt with strike hardness, and a short noise burst supplies the hammer clank.
+//! A deterministic post chain (sympathetic resonators, echo, Schroeder reverb) adds the room.
+//! The finished clip is peak-normalized (no clamping anywhere) and trimmed to its sounding span.
 //!
 //! `Chirp` implements [`rodio::Source`], so it can be played directly thru
 //! a rodio sink, mixer, or player. See the `play` example.
@@ -17,72 +25,363 @@ use rodio::{ChannelCount, Sample, SampleRate, Source};
 
 const SAMPLE_RATE_HZ: u32 = 44_100;
 
-/// Chord pitch layers: every voice identity plays all three, at base multipliers 3 : 4 : 5,
-/// scaled by the chirp's `base_freq` field.
-const PITCHES: [f64; 3] = [3.0, 4.0, 5.0];
+/// Maximum partial count (the `partials` knob selects 3..=10 of these).
+pub const MAX_PARTIALS: usize = 10;
 
-/// Number of voice identities.
-const N_IDENTITIES: usize = 9;
+/// Partial frequency ratio tables, lowest mode = 1.0 (except the bell's hum note below the prime).
+/// BAR: free-free uniform bar (glockenspiel / tine) — the classic clean "ding".
+const R_BAR: [f64; MAX_PARTIALS] = [1.0, 2.756, 5.404, 8.933, 13.345, 18.638, 24.813, 31.870, 39.808, 48.629];
+/// BELL: church-bell voicing — hum (0.5), prime, minor-third tierce, quint, nominal, and upper partials.
+const R_BELL: [f64; MAX_PARTIALS] = [0.5, 1.0, 1.188, 1.506, 2.0, 2.662, 3.011, 4.166, 5.433, 6.796];
+/// GLASS: wine-glass / thin shell modes — sparse, glassy, nearly-pure.
+const R_GLASS: [f64; MAX_PARTIALS] = [1.0, 2.32, 4.25, 6.63, 9.38, 12.22, 15.53, 19.22, 23.28, 27.70];
 
-/// One voice identity: five independent random parameters per pitch layer in `[-1, 1)`.
-/// The two sweep params (FM depth, FM rate) are shared across all voices at the `Chirp` level.
-/// Per-layer params: r0=phase offset, r1=waveshaper exponent, r2=waveshaper bias,
-///                   r3=attack offset, r4=decay-rate stretch.
+/// One decaying sine mode of the struck object. `det` is a small frequency offset for a doubled
+/// partial pair — two near-identical modes beating slowly against each other (bell warble).
 #[derive(Clone, Copy)]
-struct Voice {
-    r: [[f64; 5]; 3],
+struct Partial {
+    freq: f64,
+    amp: f64,
+    tau: f64,
+    det: f64,
 }
 
-impl Voice {
-    /// One pitch layer at plot-space `x`.
-    /// `sweep` = [fm_depth, fm_rate] shared across all voices.
-    /// `base_freq` multiplies the pitch before FM — spanning one octave shifts every note up/down together.
-    fn sample(&self, pitch_idx: usize, x: f64, sweep: [f64; 2], base_freq: f64) -> f64 {
-        let pitch = PITCHES[pitch_idx] * base_freq;
-        let [r0, r1, r2, r3, r4] = self.r[pitch_idx];
-        let [fm_depth, fm_rate] = sweep;
+/// Macro knobs for the bell voice, all in `0..1` (sliders map 1:1; internal ranges documented per field).
+#[derive(Clone, Copy, Debug)]
+pub struct BellParams {
+    /// Fundamental pitch: exp-mapped 220..2000 Hz.
+    pub pitch: f64,
+    /// Material morph: 0 = glass, 0.5 = bar (glockenspiel), 1 = church bell. Interpolates the ratio tables.
+    pub material: f64,
+    /// Fundamental ring time τ₀: exp-mapped ~0.08..4.4 s.
+    pub decay: f64,
+    /// Spectral decay slope α in τₖ = τ₀/(rₖ)^α: 0 → highs ring nearly as long as lows (glassy sustain), 1 → highs vanish instantly (dull thud).
+    pub slope: f64,
+    /// Strike hardness: tilts energy into the high modes. 0 = soft mallet (mostly fundamental), 1 = hard hammer (bright clank spectrum).
+    pub strike: f64,
+    /// Inharmonic stretch: raises each ratio to (1 + 0.08·inharm) — sharpens the upper partials the way real thick plates stretch.
+    pub inharm: f64,
+    /// Warble: doubles each partial with a slow-beating detuned twin, up to ~5 cents.
+    pub shimmer: f64,
+    /// Mode count: 0 → 3 partials (pure), 1 → all 10 (rich).
+    pub partials: f64,
+    /// Hammer noise burst amount: a few ms of decaying noise at the strike.
+    pub clank: f64,
+    /// Sub-octave hum partial (0.5×f₀, rings 1.5× longer than the fundamental) — church-bell undertone.
+    pub hum: f64,
+}
 
-        // Tone: slow tanh FM inside a sine, pushed thru an odd waveshaper for harmonics.
-        let angle = (x * (pitch + fm_depth * (x * fm_rate + 0.25).tanh() * 0.25)
-            + r0 * std::f64::consts::PI)
-            * 1024.0;
-        let tone = ((angle.sin() + 1.0).powf(3.0 + r1) - 2.0 + r2 * 0.5).tanh();
+/// Post-chain macro parameters, each in `0..1`. All are plain numbers — the chain has no runtime randomness, so equal params + seed give bit-identical output.
+#[derive(Clone, Copy, Debug)]
+pub struct PostParams {
+    /// Room size: scales the reverb comb delays AND their feedback (bigger room rings longer).
+    pub room: f64,
+    /// Wall damping: one-pole lowpass in the comb feedback. 0 = bright/metallic, 1 = warm/dead.
+    pub damp: f64,
+    /// Echo delay time: 0..1 → 5..30 ms (tight slapback; anything longer reads as lag on a notification).
+    pub echo_time: f64,
+    /// Echo feedback amount: 0 = single slap, 1 = long repeating trail.
+    pub echo_gain: f64,
+    /// Harmonic resonance: sympathetic combs tuned to the bell's lowest partials sing along.
+    pub resonance: f64,
+    /// Reverb wet mix — the ambiance floor. 0 bypasses the reverb entirely.
+    pub wet: f64,
+}
 
-        // Quarter-circle attack: silent below x ≈ -0.5, full by x ≈ 0.5, edge jittered by r3.
-        let t = (0.5 + x + r3 * 0.0625).clamp(0.0, 1.0);
-        let attack = (1.0 - (t - 1.0) * (t - 1.0)).max(0.0).sqrt();
+/// Feedback comb: `y[n] = buf[n-D]`, `buf[n] = x + y·g`. The echo line and the tuned harmonic resonators.
+#[derive(Clone)]
+struct Comb {
+    buf: Vec<f64>,
+    idx: usize,
+    g: f64,
+}
 
-        // Parabolic decay: 1 at x = -0.5, zero once (x+0.5)·(r4/4+1) reaches 1, then silent.
-        let d = ((x + 0.5) * (r4 * 0.25 + 1.0) - 1.0).min(0.0);
-        let tail = d * d;
-
-        tone * attack * tail
+impl Comb {
+    fn new(delay: usize, g: f64) -> Self {
+        Self { buf: vec![0.0; delay.max(2)], idx: 0, g }
+    }
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.buf[self.idx];
+        self.buf[self.idx] = x + y * self.g;
+        self.idx = (self.idx + 1) % self.buf.len();
+        y
     }
 }
 
-/// A deterministic notification chirp: nine voice identities, each sounding the
-/// 3 : 4 : 5 chord (27 summands), summed and divided by 8.
-///
-/// Sweep (FM depth + rate) is shared across all voices so the pitch motion is unified.
-/// `base_freq` shifts the entire chord up or down within one octave (range 1.0..2.0).
-/// All synthesis runs in `f64`; only the emitted sample is `f32`.
+/// Damped feedback comb (Freeverb-style): the feedback path runs thru a one-pole lowpass, so high frequencies die faster than lows — the "absorbent walls" of the reverb.
+#[derive(Clone)]
+struct DampComb {
+    buf: Vec<f64>,
+    idx: usize,
+    feedback: f64,
+    damp: f64,
+    store: f64,
+}
+
+impl DampComb {
+    fn new(delay: usize, feedback: f64, damp: f64) -> Self {
+        Self { buf: vec![0.0; delay.max(2)], idx: 0, feedback, damp, store: 0.0 }
+    }
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.buf[self.idx];
+        self.store = y * (1.0 - self.damp) + self.store * self.damp;
+        self.buf[self.idx] = x + self.store * self.feedback;
+        self.idx = (self.idx + 1) % self.buf.len();
+        y
+    }
+}
+
+/// Schroeder allpass diffuser: smears comb echoes into a dense tail without colouring the spectrum.
+#[derive(Clone)]
+struct Allpass {
+    buf: Vec<f64>,
+    idx: usize,
+    g: f64,
+}
+
+impl Allpass {
+    fn new(delay: usize, g: f64) -> Self {
+        Self { buf: vec![0.0; delay.max(2)], idx: 0, g }
+    }
+    fn process(&mut self, x: f64) -> f64 {
+        let d = self.buf[self.idx];
+        let y = d - self.g * x;
+        self.buf[self.idx] = x + self.g * d;
+        self.idx = (self.idx + 1) % self.buf.len();
+        y
+    }
+}
+
+/// The assembled mono post chain: dry → (+ tuned resonators) → (+ echo) → Schroeder reverb → wet mix.
+/// State starts zeroed and every step is pure DSP, so the output is a deterministic function of (params, seed, input stream).
+#[derive(Clone)]
+struct Post {
+    res: [Comb; 3],
+    res_gain: f64,
+    echo: Comb,
+    echo_gain: f64,
+    combs: [DampComb; 4],
+    aps: [Allpass; 2],
+    wet: f64,
+}
+
+impl Post {
+    /// `res_freqs` are the sounding frequencies (Hz) the sympathetic resonators tune to — the bell's lowest partials.
+    fn new(p: PostParams, seed: u64, res_freqs: [f64; 3]) -> Self {
+        let sr = SAMPLE_RATE_HZ as f64;
+
+        let res_g = 0.82 + p.resonance * 0.15;
+        let res = std::array::from_fn(|i| {
+            let delay = (sr / res_freqs[i].max(20.0)).round() as usize;
+            Comb::new(delay, res_g)
+        });
+
+        // Echo: 5..30 ms — a tight slapback thickener, not a laggy repeat.
+        // Seed-jittered ±5% so no two hashes share a slap time exactly.
+        // The comb's first tap emerges at FULL input amplitude, so the audible slap level must be gated by the output gain (echo_gain param), not the comb feedback — feedback only shapes how the trail of repeats decays.
+        let echo_delay =
+            ((0.005 + p.echo_time * 0.025) * (1.0 + mix_unit(seed, 310) * 0.05) * sr) as usize;
+        let echo = Comb::new(echo_delay, p.echo_gain * 0.55);
+
+        // Reverb: Freeverb comb tunings scaled by room size, each seed-jittered ±3% (mutually prime-ish lengths keep the tail dense instead of fluttery).
+        let scale = 0.6 + p.room * 1.4;
+        let base_delays = [1116.0, 1188.0, 1277.0, 1356.0];
+        let feedback = (0.70 + p.room * 0.28).min(0.98);
+        let damp = 0.15 + p.damp * 0.55;
+        let combs = std::array::from_fn(|i| {
+            let jitter = 1.0 + mix_unit(seed, 300 + i as u64) * 0.03;
+            DampComb::new((base_delays[i] * scale * jitter) as usize, feedback, damp)
+        });
+        let aps = [Allpass::new(556, 0.5), Allpass::new(441, 0.5)];
+
+        Self {
+            res,
+            res_gain: p.resonance * 0.45,
+            echo,
+            echo_gain: p.echo_gain * 0.8,
+            combs,
+            aps,
+            wet: p.wet,
+        }
+    }
+
+    /// Zero every delay line and filter state — back to the pristine just-constructed chain.
+    fn reset(&mut self) {
+        for r in &mut self.res {
+            r.buf.fill(0.0);
+            r.idx = 0;
+        }
+        self.echo.buf.fill(0.0);
+        self.echo.idx = 0;
+        for c in &mut self.combs {
+            c.buf.fill(0.0);
+            c.idx = 0;
+            c.store = 0.0;
+        }
+        for a in &mut self.aps {
+            a.buf.fill(0.0);
+            a.idx = 0;
+        }
+    }
+
+    /// One sample thru the chain. Order: sympathetic resonance rides on the dry, echo taps that, reverb diffuses the sum, wet mixes the room back in.
+    fn process(&mut self, dry: f64) -> f64 {
+        let mut res_sum = 0.0;
+        for r in &mut self.res {
+            res_sum += r.process(dry);
+        }
+        let voiced = dry + res_sum * self.res_gain;
+
+        let echoed = voiced + self.echo.process(voiced) * self.echo_gain;
+
+        let mut rev = 0.0;
+        for c in &mut self.combs {
+            rev += c.process(echoed);
+        }
+        rev *= 0.25;
+        for a in &mut self.aps {
+            rev = a.process(rev);
+        }
+
+        echoed + rev * self.wet
+    }
+}
+
+/// One struck bell within the chime: its modes, its hammer, and when it gets hit.
+#[derive(Clone)]
+struct Strike {
+    /// Strike time in seconds from clip start.
+    offset: f64,
+    partials: Vec<Partial>,
+    /// Overall level of this bell (root slightly louder than the harmony bells).
+    level: f64,
+    /// Hammer noise burst: amplitude, and the seed the per-sample noise hashes from.
+    clank: f64,
+    clank_seed: u64,
+}
+
+impl Strike {
+    /// The bell's dry output at clip time `t` (silent before its strike offset).
+    fn sample(&self, t: f64) -> f64 {
+        let t = t - self.offset;
+        if t < 0.0 {
+            return 0.0;
+        }
+        let mut acc = 0.0f64;
+        for q in &self.partials {
+            // Envelope: (x-1)²·√(1-(x-1)²) over x ∈ 0..1, x = t normalized to this mode's lifetime (4τ, so higher modes still die first).
+            // Zero at BOTH ends (no exponential tail, no click), peak 2/(3√3) at x ≈ 0.184, scaled to unity.
+            let x = t / (q.tau * 4.0);
+            if x >= 1.0 {
+                continue;
+            }
+            let u = x - 1.0;
+            let u2 = u * u;
+            let env = u2 * (1.0 - u2).max(0.0).sqrt() * 2.598_076_211_353_316;
+            let a = (std::f64::consts::TAU * q.freq * t).sin();
+            let s = if q.det != 0.0 {
+                (a + (std::f64::consts::TAU * (q.freq + q.det) * t).sin()) * 0.5
+            } else {
+                a
+            };
+            acc += q.amp * s * env;
+        }
+        // Hammer: white noise hashed per sample index, 4 ms exponential burst.
+        if self.clank > 0.0 && t < 0.02 {
+            let n = (t * SAMPLE_RATE_HZ as f64) as u64;
+            acc += mix_unit(self.clank_seed, 700 + n) * self.clank * 0.8 * (-t / 0.004).exp();
+        }
+        acc * self.level
+    }
+}
+
+/// Chime-level knobs, all in `0..1`: how the three bells relate in time and character. Pitch relation is fixed sus4 (see [`CHORD`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ChimeParams {
+    /// Strike scatter: each bell's strike time is an independent seed-drawn offset in a ±(spacing × 20 ms) window — near-simultaneous, any order (whichever bell's draw lands earliest strikes first).
+    pub spacing: f64,
+    /// How much the three castings differ: scales each bell's per-partial jitter. 0 = identical copies, 1 = clearly individual bells.
+    pub spread: f64,
+}
+
+/// A deterministic notification chime: three matched modal bells in harmony (shared
+/// material / damping / mallet, per-bell pitch / seed / strike time), struck into ONE
+/// shared room. All synthesis runs in `f64`; the finished clip is peak-normalized and trimmed.
 #[derive(Clone)]
 pub struct Chirp {
     sample_rate: u32,
     total_samples: u32,
     cursor: u32,
-    x_start: f64,
-    x_rate: f64,
-    voices: [Voice; 9],
-    /// [fm_depth, fm_rate] — shared single sweep applied to all 27 voice-layer summands.
-    sweep: [f64; 2],
-    /// Pitch multiplier in [1.0, 2.0]: 1.0 = base chord [3,4,5], 2.0 = one octave up [6,8,10].
-    base_freq: f64,
-    master: f64,
+    strikes: Vec<Strike>,
+    /// Deterministic post FX chain (resonators + echo + reverb). `None` = dry.
+    post: Option<Post>,
+    /// Sample count of the dry voice span. `total_samples` extends past this for the post tail.
+    dry_samples: u32,
+    /// Sounding frequencies of the root bell's three lowest partials — the post resonators tune to these.
+    res_freqs: [f64; 3],
+    /// The finished clip: rendered in f64 with NO clamping, peak-normalized to full scale, then trimmed to the span that actually sounds (every patch's lead-in delay and ring-out length differ).
+    /// Built by `finalize()` at construction; the Iterator/Source impls just stream it.
+    rendered: Vec<f32>,
+}
+
+/// Interpolate the material ratio tables: 0 = glass, 0.5 = bar, 1 = bell.
+fn material_ratio(material: f64, k: usize) -> f64 {
+    let m = material.clamp(0.0, 1.0);
+    if m < 0.5 {
+        let t = m * 2.0;
+        R_GLASS[k] * (1.0 - t) + R_BAR[k] * t
+    } else {
+        let t = (m - 0.5) * 2.0;
+        R_BAR[k] * (1.0 - t) + R_BELL[k] * t
+    }
+}
+
+/// The chime chord: strictly sus4 (1 : 4/3 : 3/2) — no third, unresolved, attention-getting; the PA/transit-chime family. Beats least against casting jitter of the just triads.
+const CHORD: [f64; 3] = [1.0, 4.0 / 3.0, 1.5];
+
+/// Build one bell's mode set at fundamental `f0`.
+/// `jitter` scales the per-partial randomness (the chime's `spread`: 0 = exact casting, 1 = full individuality).
+fn build_partials(p: &BellParams, f0: f64, seed: u64, jitter: f64) -> Vec<Partial> {
+    let tau0 = 0.02 * (p.decay.clamp(0.0, 1.0) * 2.5).exp(); // 0.02..0.24 s — the dry ring (4τ) tops out around a second
+    let alpha = 0.3 + p.slope.clamp(0.0, 1.0) * 1.7;
+    let tilt = 1.6 - p.strike.clamp(0.0, 1.0) * 1.2; // hard strike flattens the spectrum
+    let stretch = 1.0 + p.inharm.clamp(0.0, 1.0) * 0.08;
+    let n_partials = 3 + (p.partials.clamp(0.0, 1.0) * (MAX_PARTIALS - 3) as f64).round() as usize;
+
+    let mut partials = Vec::with_capacity(n_partials + 1);
+    for k in 0..n_partials {
+        let jf = 1.0 + mix_unit(seed, 500 + k as u64) * 0.003 * jitter;
+        let jt = 1.0 + mix_unit(seed, 520 + k as u64) * 0.25 * jitter;
+        let ja = 1.0 + mix_unit(seed, 540 + k as u64) * 0.2 * jitter;
+        let ratio = material_ratio(p.material, k).powf(stretch) * jf;
+        let freq = f0 * ratio;
+        // Nyquist guard: partials that would alias are dropped, not folded.
+        if freq > SAMPLE_RATE_HZ as f64 * 0.45 {
+            continue;
+        }
+        // Warble: beating twin up to ~5 cents (0.3% of the partial), seed-signed so pairs drift both ways.
+        let det = p.shimmer.clamp(0.0, 1.0) * freq * 0.003 * mix_unit(seed, 560 + k as u64);
+        partials.push(Partial {
+            freq,
+            amp: ja / ratio.max(0.4).powf(tilt),
+            tau: (tau0 / ratio.max(0.4).powf(alpha)) * jt,
+            det,
+        });
+    }
+    // Sub-octave hum: rings 1.5x longer than the fundamental — the church-bell undertone.
+    if p.hum > 0.0 {
+        partials.push(Partial {
+            freq: f0 * 0.5,
+            amp: p.hum * 0.7,
+            tau: tau0 * 1.5,
+            det: 0.0,
+        });
+    }
+    partials
 }
 
 impl Chirp {
-    /// Build a chirp deterministically from a 256-bit hash.
+    /// Build a chime deterministically from a 256-bit hash: bells, harmony, timing, and room all derive from the seed.
     pub fn from_hash(hash: [u8; 32]) -> Self {
         let mut seed = 0u64;
         for lane in 0..4 {
@@ -90,89 +389,195 @@ impl Chirp {
             b.copy_from_slice(&hash[lane * 8..lane * 8 + 8]);
             seed ^= u64::from_le_bytes(b).rotate_left(lane as u32 * 17);
         }
-        let duration = 0.75 + (mix_unit(seed, 100) * 0.5 + 0.5) * 0.3;
-        Self::from_params([0.0; 5], 1.0, seed, duration)
+        let u = |idx: u64| mix_unit(seed, idx) * 0.5 + 0.5;
+        // Desk-bell ranges: small, bright, short.
+        // Ranges from the ear-derived 29-keeper tuning session: decay and room under 0.5; everything else survived full-range listening.
+        let bell = BellParams {
+            pitch: u(100),
+            material: u(101),
+            decay: u(102) * 0.5,
+            slope: u(103),
+            strike: u(104),
+            inharm: u(105),
+            shimmer: u(106),
+            partials: u(107),
+            clank: u(108),
+            hum: u(109),
+        };
+        let chime = ChimeParams {
+            spacing: 0.3 + u(111) * 0.7,
+            spread: 0.3 + u(112) * 0.6,
+        };
+        // Small mostly-dry room: enough ambiance to place the chime in space without haunting it.
+        let post = PostParams {
+            room: u(400) * 0.5,
+            damp: u(401),
+            echo_time: u(402),
+            echo_gain: u(403) * 0.2,
+            resonance: u(404) * 0.25,
+            wet: 0.06 + u(405) * 0.16,
+        };
+        Self::from_chime(bell, chime, seed).with_post(post, seed)
     }
 
-    /// Build a chirp from macro voice parameters.
+    /// Build a single bell (a chime with zero spacing and one strike) — kept for API symmetry and quick tests.
+    pub fn from_bell(p: BellParams, seed: u64) -> Self {
+        Self::from_chime(p, ChimeParams { spacing: 0.0, spread: 0.0 }, seed)
+    }
+
+    /// Build a three-bell chime from explicit macro knobs — the tuning-UI entry point.
     ///
-    /// `base` is five per-voice knobs (phase, shape, bias, attack, decay), each nominally `-1..1`.
-    /// Sweep (FM depth, rate) and `base_freq` are derived from `seed`.
-    /// `spread` controls per-voice jitter around `base`; 0 = unison, 1 = fully random.
-    pub fn from_params(base: [f64; 5], spread: f64, seed: u64, duration: f64) -> Self {
-        let mut voices = [Voice { r: [[0.0; 5]; 3] }; N_IDENTITIES];
-        for (k, v) in voices.iter_mut().enumerate() {
-            for (p, layer) in v.r.iter_mut().enumerate() {
-                for (j, r) in layer.iter_mut().enumerate() {
-                    *r = (base[j] + mix_unit(seed, (k * 24 + p * 8 + j) as u64) * spread)
-                        .clamp(-1.0, 1.0);
-                }
+    /// Locked across the three bells: material, damping slope, mallet (strike + clank), inharmonic stretch, partial count, shimmer amount — the instrument identity.
+    /// Broken apart per bell: pitch (chord ratios off the root), strike time (spacing × order), jitter seed (each bell its own casting, scaled by `spread`), decay (higher bell rings shorter, physics), and level (root slightly louder, ±4% human jitter).
+    /// The root fundamental maps to 1024..2048 Hz — desk bell, not church tower.
+    pub fn from_chime(p: BellParams, c: ChimeParams, seed: u64) -> Self {
+        let f_root = 1024.0 * 2.0f64.powf(p.pitch.clamp(0.0, 1.0)); // 1024..2048 Hz
+        // Strike scatter: each bell draws an independent offset in ±(spacing × 20 ms) — near-simultaneous flam, any order.
+        let window = c.spacing.clamp(0.0, 1.0) * 0.020;
+
+        let mut strikes = Vec::with_capacity(3);
+        for k in 0..3 {
+            let ratio = CHORD[k];
+            // Each bell is its own casting: an independent jitter seed, individuality scaled by spread.
+            let bell_seed = seed ^ (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut partials = build_partials(&p, f_root * ratio, bell_seed, c.spread);
+            // Physics: the higher (smaller) bell rings shorter. Scale every mode's tau down by the chord ratio.
+            let tau_scale = 1.0 / ratio.powf(0.75);
+            for q in &mut partials {
+                q.tau *= tau_scale;
             }
+            // Level: root a touch louder than the harmony bells, ±4% per-strike human jitter.
+            let level =
+                (1.0 / ratio.powf(0.3)) * (1.0 + mix_unit(bell_seed, 600) * 0.04);
+            strikes.push(Strike {
+                offset: mix_unit(bell_seed, 610) * window,
+                partials,
+                level,
+                clank: p.clank.clamp(0.0, 1.0),
+                clank_seed: bell_seed,
+            });
         }
-        let sweep = [mix_unit(seed, 200), mix_unit(seed, 201)];
-        // base_freq: seed-derived in [1.0, 2.0] (one octave).
-        let base_freq = 1.0 + (mix_unit(seed, 202) * 0.5 + 0.5);
-        let duration = duration.clamp(0.05, 10.0);
+        // Shift so the earliest strike lands at t = 0 (offsets were drawn in ±window).
+        let min_offset = strikes.iter().map(|s| s.offset).fold(f64::MAX, f64::min);
+        for s in &mut strikes {
+            s.offset -= min_offset;
+        }
+
+        // Clip length: last strike + ~4 time constants of the slowest mode anywhere.
+        let max_tau = strikes
+            .iter()
+            .flat_map(|s| s.partials.iter().map(|q| q.tau))
+            .fold(0.0f64, f64::max);
+        let last_offset = strikes.iter().map(|s| s.offset).fold(0.0f64, f64::max);
+        // Dry span capped at ~1.1 s — a desk bell, not a resonating hall.
+        let duration = (last_offset + max_tau * 4.0 + 0.1).clamp(0.2, 1.1);
         let total_samples = (SAMPLE_RATE_HZ as f64 * duration) as u32;
+
+        // Resonator targets: the root bell's three lowest sounding partials.
+        let mut freqs: Vec<f64> = strikes[0].partials.iter().map(|q| q.freq).collect();
+        freqs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let res_freqs = [
+            *freqs.first().unwrap_or(&f_root),
+            *freqs.get(1).unwrap_or(&(f_root * 2.0)),
+            *freqs.get(2).unwrap_or(&(f_root * 3.0)),
+        ];
+
         Self {
             sample_rate: SAMPLE_RATE_HZ,
             total_samples,
             cursor: 0,
-            x_start: -1.0,
-            x_rate: 2.0 / duration,
-            voices,
-            sweep,
-            base_freq,
-            master: 1.0 / 8.0,
+            strikes,
+            post: None,
+            dry_samples: total_samples,
+            res_freqs,
+            rendered: Vec::new(),
         }
+        .finalize()
     }
 
-    /// Build a chirp directly from raw per-layer parameters — the full-resolution tuning-UI entry
-    /// point.
-    ///
-    /// `params[k][p][j]`: voice identity `k`, pitch layer `p`, parameter `j`
-    /// (0=phase, 1=shape, 2=bias, 3=attack, 4=decay), nominally in `-1..1`.
-    /// `sweep` = [fm_depth, fm_rate] applied uniformly to all voices.
-    /// `base_freq` in `[1.0, 2.0]` shifts the whole chord up by up to one octave.
-    pub fn from_raw(
-        params: [[[f64; 5]; 3]; 9],
-        sweep: [f64; 2],
-        base_freq: f64,
-        duration: f64,
-    ) -> Self {
-        let mut voices = [Voice { r: [[0.0; 5]; 3] }; N_IDENTITIES];
-        for (k, v) in voices.iter_mut().enumerate() {
-            v.r = params[k];
-        }
-        let duration = duration.clamp(0.05, 10.0);
-        let total_samples = (SAMPLE_RATE_HZ as f64 * duration) as u32;
-        Self {
-            sample_rate: SAMPLE_RATE_HZ,
-            total_samples,
-            cursor: 0,
-            x_start: -1.0,
-            x_rate: 2.0 / duration,
-            voices,
-            sweep,
-            base_freq,
-            master: 1.0 / 8.0,
-        }
+    /// Install the deterministic post chain (resonators + echo + reverb) and extend the clip so the room tail rings out instead of being chopped at the dry end.
+    /// `seed` jitters the comb/echo delays so distinct hashes get audibly distinct rooms; equal (params, seed) is bit-identical.
+    pub fn with_post(mut self, params: PostParams, seed: u64) -> Self {
+        // Tail length scales with how live the room is, capped at ~0.9 s so dry + tail stays inside 2 s total.
+        let tail_secs = (0.15
+            + params.wet * (0.5 + params.room * 1.2)
+            + params.echo_gain * (0.005 + params.echo_time * 0.025) * 3.0
+            + params.resonance * 0.3)
+            .min(0.9);
+        self.total_samples = self.dry_samples + (SAMPLE_RATE_HZ as f64 * tail_secs) as u32;
+        self.post = Some(Post::new(params, seed, self.res_freqs));
+        self.finalize()
     }
 
-    /// Hash arbitrary bytes and build a chirp from the result.
+    /// Hash arbitrary bytes and build a bell from the result.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self::from_hash(hash256(bytes))
     }
 
-    /// The instantaneous signal at formula-space `x ∈ [-1, 1]`, clamped to `[-1, 1]`.
-    pub fn signal(&self, x: f64) -> f64 {
-        let mut acc = 0.0f64;
-        for v in &self.voices {
-            for p in 0..PITCHES.len() {
-                acc += v.sample(p, x, self.sweep, self.base_freq);
+    /// The dry chime at time `t` seconds — a pure function (each strike's modal sum is memoryless).
+    pub fn signal(&self, t: f64) -> f64 {
+        self.strikes.iter().map(|s| s.sample(t)).sum()
+    }
+
+    /// Render, normalize, and trim — the second pass that turns the synth into the finished clip.
+    ///
+    /// 1. Raw render in f64 with NO clamping: dry voice over its span, post chain (if any) over the whole extended length.
+    /// 2. Peak-normalize: full scale is defined by the clip's own min/max, so the post chain can swing past ±1 internally without distortion and quiet patches still fill the range.
+    /// 3. Trim: find the first and last samples above -60 dB of peak and cut the silence outside them (each patch's lead-in delay and ring-out length differ, so start/stop are found per clip, not assumed).
+    /// Short edge fades (1.5 ms in, 12 ms out) keep the trimmed boundaries click-free.
+    fn finalize(mut self) -> Self {
+        let n = self.total_samples as usize;
+        let sr = self.sample_rate as f64;
+        let mut raw = Vec::with_capacity(n);
+        for i in 0..n {
+            let dry = if (i as u32) < self.dry_samples {
+                self.signal(i as f64 / sr)
+            } else {
+                0.0
+            };
+            let out = match &mut self.post {
+                Some(p) => p.process(dry),
+                None => dry,
+            };
+            raw.push(out);
+        }
+        // Reset post state so a hypothetical second finalize starts clean.
+        if let Some(p) = &mut self.post {
+            p.reset();
+        }
+
+        let peak = raw.iter().fold(0.0f64, |m, s| m.max(s.abs()));
+        if peak > 0.0 {
+            let scale = 1.0 / peak;
+            for s in &mut raw {
+                *s *= scale;
             }
         }
-        (acc * self.master).clamp(-1.0, 1.0)
+
+        // -60 dB threshold relative to the (now unit) peak.
+        let thr = 1.0 / 1024.0;
+        let first = raw.iter().position(|s| s.abs() > thr).unwrap_or(0);
+        let last = raw.iter().rposition(|s| s.abs() > thr).unwrap_or(n.saturating_sub(1));
+        // Keep ~1.5 ms of pre-roll so a fast strike's leading edge isn't shaved.
+        let start = first.saturating_sub((sr * 0.0015) as usize);
+        let end = (last + 1).min(n);
+        let mut clip: Vec<f32> = raw[start..end].iter().map(|&s| s as f32).collect();
+
+        // Edge fades: 1.5 ms in, 12 ms out.
+        let fade_in = ((sr * 0.0015) as usize).min(clip.len());
+        for i in 0..fade_in {
+            clip[i] *= i as f32 / fade_in as f32;
+        }
+        let fade_out = ((sr * 0.012) as usize).min(clip.len());
+        let len = clip.len();
+        for i in 0..fade_out {
+            clip[len - 1 - i] *= i as f32 / fade_out as f32;
+        }
+
+        self.total_samples = clip.len() as u32;
+        self.cursor = 0;
+        self.rendered = clip;
+        self
     }
 
     /// Render the complete waveform as an SVG string (1200×200, white polyline on black).
@@ -192,6 +597,9 @@ fn mix_unit(seed: u64, idx: u64) -> f64 {
 }
 
 /// Render a slice of `f32` samples as an SVG waveform.
+///
+/// Every sample becomes a point on a white polyline over a black background.
+/// The output is a complete 1200×200 SVG document.
 pub fn samples_to_svg(samples: &[f32]) -> String {
     let n = samples.len();
     let width = 1200.0_f32;
@@ -226,10 +634,10 @@ impl Iterator for Chirp {
         if self.cursor >= self.total_samples {
             return None;
         }
-        let t = self.cursor as f64 / self.sample_rate as f64;
-        let x = self.x_start + self.x_rate * t;
+        // Stream the finalized clip — rendering, normalization, and trimming all happened at construction.
+        let s = self.rendered[self.cursor as usize];
         self.cursor += 1;
-        Some(self.signal(x) as f32)
+        Some(s)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -258,7 +666,10 @@ impl Source for Chirp {
     }
 }
 
-/// Produce a 256-bit hash from arbitrary bytes. Not cryptographic.
+/// Produce a 256-bit hash from arbitrary bytes. Not cryptographic; we only
+/// need stability and good avalanche so that small input differences produce
+/// audibly different chirps. Runs four independent FxHash-style passes with
+/// distinct seeds.
 fn hash256(bytes: &[u8]) -> [u8; 32] {
     const SEEDS: [u64; 4] = [
         0xcbf29ce484222325,
@@ -323,11 +734,18 @@ mod tests {
     }
 
     #[test]
+    fn normalized_to_full_scale() {
+        let peak = Chirp::from_hash(HASH_A).fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.95, "clip should be peak-normalized (peak {peak})");
+    }
+
+    #[test]
     fn svg_contains_all_samples() {
         let chirp = Chirp::from_hash(HASH_A);
         let expected_points = chirp.total_samples as usize;
         let svg = Chirp::from_hash(HASH_A).to_svg();
         assert!(svg.starts_with("<svg"));
+        // Each sample becomes a point; points are space-separated.
         let start = svg.find("points=\"").unwrap() + 8;
         let end = svg[start..].find('"').unwrap() + start;
         let point_count = svg[start..end].split(' ').count();

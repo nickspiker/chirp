@@ -15,7 +15,9 @@ fn main() {
         args.iter().map(String::as_str).collect()
     };
 
-    let handle = DeviceSinkBuilder::open_default_sink().expect("open default audio device");
+    let mut handle = DeviceSinkBuilder::open_default_sink().expect("open default audio device");
+    // We drop the sink deliberately at process exit; silence rodio's drop warning.
+    handle.log_on_drop(false);
     let player = Player::connect_new(&handle.mixer());
 
     for label in labels {
