@@ -17,39 +17,43 @@ use rodio::{ChannelCount, Sample, SampleRate, Source};
 
 const SAMPLE_RATE_HZ: u32 = 44_100;
 
-/// Chord pitch layers: every voice identity plays all three, at base multipliers 3 : 4 : 5.
-/// The multiplier sits INSIDE the FM term (`x·(P + wobble)`), exactly as in the source formula.
+/// Chord pitch layers: every voice identity plays all three, at base multipliers 3 : 4 : 5,
+/// scaled by the chirp's `base_freq` field.
 const PITCHES: [f64; 3] = [3.0, 4.0, 5.0];
 
-/// Number of voice identities. Each identity owns seven randoms shared by all three of its pitch layers, so an identity's three notes detune, phase, shape, and gate together.
+/// Number of voice identities.
 const N_IDENTITIES: usize = 9;
 
-/// One voice identity: seven random parameters in `[-1, 1)`.
-/// r0: FM depth, r1: FM rate, r2: phase offset, r3: waveshaper exponent, r4: waveshaper bias, r5: attack offset, r6: decay-rate stretch.
+/// One voice identity: five independent random parameters per pitch layer in `[-1, 1)`.
+/// The two sweep params (FM depth, FM rate) are shared across all voices at the `Chirp` level.
+/// Per-layer params: r0=phase offset, r1=waveshaper exponent, r2=waveshaper bias,
+///                   r3=attack offset, r4=decay-rate stretch.
 #[derive(Clone, Copy)]
 struct Voice {
-    r: [f64; 7],
+    r: [[f64; 5]; 3],
 }
 
 impl Voice {
-    /// One pitch layer of this identity at plot-space `x` — a verbatim port of the Plotypus formula (one summand of the 27):
-    /// `tanh((sin((x·(P + r0·tanh(x·r1 + 1>>2)>>2) + r2·π)<<10) + 1)^(3+r3) − 2 + r4>>1)`
-    /// `· sqrt(1 − (max(min(½ + x + (r5>>4), 1), 0) − 1)²)`   (quarter-circle attack)
-    /// `· min(0, (x+½)·(r6>>2 + 1) − 1)²`                     (parabolic decay tail)
-    fn sample(&self, pitch: f64, x: f64) -> f64 {
-        let [r0, r1, r2, r3, r4, r5, r6] = self.r;
+    /// One pitch layer at plot-space `x`.
+    /// `sweep` = [fm_depth, fm_rate] shared across all voices.
+    /// `base_freq` multiplies the pitch before FM — spanning one octave shifts every note up/down together.
+    fn sample(&self, pitch_idx: usize, x: f64, sweep: [f64; 2], base_freq: f64) -> f64 {
+        let pitch = PITCHES[pitch_idx] * base_freq;
+        let [r0, r1, r2, r3, r4] = self.r[pitch_idx];
+        let [fm_depth, fm_rate] = sweep;
 
         // Tone: slow tanh FM inside a sine, pushed thru an odd waveshaper for harmonics.
-        let angle =
-            (x * (pitch + r0 * (x * r1 + 0.25).tanh() * 0.25) + r2 * std::f64::consts::PI) * 1024.0;
-        let tone = ((angle.sin() + 1.0).powf(3.0 + r3) - 2.0 + r4 * 0.5).tanh();
+        let angle = (x * (pitch + fm_depth * (x * fm_rate + 0.25).tanh() * 0.25)
+            + r0 * std::f64::consts::PI)
+            * 1024.0;
+        let tone = ((angle.sin() + 1.0).powf(3.0 + r1) - 2.0 + r2 * 0.5).tanh();
 
-        // Quarter-circle attack: silent below x ≈ -0.5, full by x ≈ 0.5, edge jittered by r5.
-        let t = (0.5 + x + r5 * 0.0625).clamp(0.0, 1.0);
+        // Quarter-circle attack: silent below x ≈ -0.5, full by x ≈ 0.5, edge jittered by r3.
+        let t = (0.5 + x + r3 * 0.0625).clamp(0.0, 1.0);
         let attack = (1.0 - (t - 1.0) * (t - 1.0)).max(0.0).sqrt();
 
-        // Parabolic decay: 1 at x = -0.5, zero once (x+0.5)·(r6/4+1) reaches 1, then silent.
-        let d = ((x + 0.5) * (r6 * 0.25 + 1.0) - 1.0).min(0.0);
+        // Parabolic decay: 1 at x = -0.5, zero once (x+0.5)·(r4/4+1) reaches 1, then silent.
+        let d = ((x + 0.5) * (r4 * 0.25 + 1.0) - 1.0).min(0.0);
         let tail = d * d;
 
         tone * attack * tail
@@ -57,97 +61,121 @@ impl Voice {
 }
 
 /// A deterministic notification chirp: nine voice identities, each sounding the
-/// 3 : 4 : 5 chord (27 summands), summed and divided by 8 — a verbatim port of the
-/// Plotypus-designed formula. All synthesis runs in `f64`; only the emitted sample is `f32`.
+/// 3 : 4 : 5 chord (27 summands), summed and divided by 8.
 ///
-/// Construct with [`Chirp::from_hash`] (or [`Chirp::from_bytes`] for arbitrary
-/// input). The struct itself is the audio source: iterate it for raw `f32`
-/// samples, or hand it to rodio for playback.
+/// Sweep (FM depth + rate) is shared across all voices so the pitch motion is unified.
+/// `base_freq` shifts the entire chord up or down within one octave (range 1.0..2.0).
+/// All synthesis runs in `f64`; only the emitted sample is `f32`.
 #[derive(Clone)]
 pub struct Chirp {
     sample_rate: u32,
     total_samples: u32,
     cursor: u32,
-    /// Plot-space x at t=0 and its rate of change per second — the voice formula is evaluated in x-space.
     x_start: f64,
     x_rate: f64,
     voices: [Voice; 9],
+    /// [fm_depth, fm_rate] — shared single sweep applied to all 27 voice-layer summands.
+    sweep: [f64; 2],
+    /// Pitch multiplier in [1.0, 2.0]: 1.0 = base chord [3,4,5], 2.0 = one octave up [6,8,10].
+    base_freq: f64,
     master: f64,
 }
 
 impl Chirp {
     /// Build a chirp deterministically from a 256-bit hash.
-    ///
-    /// The hash folds to a 64-bit seed; every per-voice parameter is an
-    /// independent SplitMix64 expansion of `(seed, index)`. The mapping is
-    /// stable across releases that share a major version.
     pub fn from_hash(hash: [u8; 32]) -> Self {
-        // Fold the four 64-bit lanes so every hash bit influences the seed.
         let mut seed = 0u64;
         for lane in 0..4 {
             let mut b = [0u8; 8];
             b.copy_from_slice(&hash[lane * 8..lane * 8 + 8]);
             seed ^= u64::from_le_bytes(b).rotate_left(lane as u32 * 17);
         }
-        // Duration wobbles per hash (0.75-1.05 s).
         let duration = 0.75 + (mix_unit(seed, 100) * 0.5 + 0.5) * 0.3;
-        Self::from_params([0.0; 7], 1.0, seed, duration)
+        Self::from_params([0.0; 5], 1.0, seed, duration)
     }
 
-    /// Build a chirp from explicit voice parameters — the tuning-UI entry point.
+    /// Build a chirp from macro voice parameters.
     ///
-    /// `base` is the seven formula knobs (FM depth, FM rate, phase, shape, bias, attack offset, decay stretch), each nominally `-1..1`.
-    /// Every voice identity takes `base[j] + jitter·spread` where jitter is an independent `(seed, identity, param)` hash in `-1..1` — `spread = 0` makes all nine identities share the base values exactly, `spread = 1` with zero base reproduces [`Chirp::from_hash`]'s full-random voicing.
-    /// `duration` is the clip length in seconds; the formula's x domain `-1..1` sweeps over it.
-    pub fn from_params(base: [f64; 7], spread: f64, seed: u64, duration: f64) -> Self {
-        let mut voices = [Voice { r: [0.0; 7] }; N_IDENTITIES];
+    /// `base` is five per-voice knobs (phase, shape, bias, attack, decay), each nominally `-1..1`.
+    /// Sweep (FM depth, rate) and `base_freq` are derived from `seed`.
+    /// `spread` controls per-voice jitter around `base`; 0 = unison, 1 = fully random.
+    pub fn from_params(base: [f64; 5], spread: f64, seed: u64, duration: f64) -> Self {
+        let mut voices = [Voice { r: [[0.0; 5]; 3] }; N_IDENTITIES];
         for (k, v) in voices.iter_mut().enumerate() {
-            for (j, r) in v.r.iter_mut().enumerate() {
-                *r = (base[j] + mix_unit(seed, (k * 8 + j) as u64) * spread).clamp(-1.0, 1.0);
+            for (p, layer) in v.r.iter_mut().enumerate() {
+                for (j, r) in layer.iter_mut().enumerate() {
+                    *r = (base[j] + mix_unit(seed, (k * 24 + p * 8 + j) as u64) * spread)
+                        .clamp(-1.0, 1.0);
+                }
             }
         }
-
+        let sweep = [mix_unit(seed, 200), mix_unit(seed, 201)];
+        // base_freq: seed-derived in [1.0, 2.0] (one octave).
+        let base_freq = 1.0 + (mix_unit(seed, 202) * 0.5 + 0.5);
         let duration = duration.clamp(0.05, 10.0);
         let total_samples = (SAMPLE_RATE_HZ as f64 * duration) as u32;
-
         Self {
             sample_rate: SAMPLE_RATE_HZ,
             total_samples,
             cursor: 0,
-            // The formula's time domain is x ∈ [-1, 1], swept linearly over the duration.
             x_start: -1.0,
             x_rate: 2.0 / duration,
             voices,
-            // The source formula's final `>>3`.
+            sweep,
+            base_freq,
             master: 1.0 / 8.0,
         }
     }
 
-    /// Hash arbitrary bytes with a stable, non-cryptographic mixer and build
-    /// a chirp from the result. Useful when the caller has a string event id
-    /// rather than a precomputed hash.
+    /// Build a chirp directly from raw per-layer parameters — the full-resolution tuning-UI entry
+    /// point.
+    ///
+    /// `params[k][p][j]`: voice identity `k`, pitch layer `p`, parameter `j`
+    /// (0=phase, 1=shape, 2=bias, 3=attack, 4=decay), nominally in `-1..1`.
+    /// `sweep` = [fm_depth, fm_rate] applied uniformly to all voices.
+    /// `base_freq` in `[1.0, 2.0]` shifts the whole chord up by up to one octave.
+    pub fn from_raw(
+        params: [[[f64; 5]; 3]; 9],
+        sweep: [f64; 2],
+        base_freq: f64,
+        duration: f64,
+    ) -> Self {
+        let mut voices = [Voice { r: [[0.0; 5]; 3] }; N_IDENTITIES];
+        for (k, v) in voices.iter_mut().enumerate() {
+            v.r = params[k];
+        }
+        let duration = duration.clamp(0.05, 10.0);
+        let total_samples = (SAMPLE_RATE_HZ as f64 * duration) as u32;
+        Self {
+            sample_rate: SAMPLE_RATE_HZ,
+            total_samples,
+            cursor: 0,
+            x_start: -1.0,
+            x_rate: 2.0 / duration,
+            voices,
+            sweep,
+            base_freq,
+            master: 1.0 / 8.0,
+        }
+    }
+
+    /// Hash arbitrary bytes and build a chirp from the result.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self::from_hash(hash256(bytes))
     }
 
     /// The instantaneous signal at formula-space `x ∈ [-1, 1]`, clamped to `[-1, 1]`.
-    /// This is the pure function the sample iterator walks — exposed so viewers can
-    /// supersample the waveform at arbitrary x positions (stochastic anti-aliasing).
-    /// Sum of all identities × all pitch layers (27 summands), scaled by the master `>>3`.
     pub fn signal(&self, x: f64) -> f64 {
         let mut acc = 0.0f64;
         for v in &self.voices {
-            for &p in &PITCHES {
-                acc += v.sample(p, x);
+            for p in 0..PITCHES.len() {
+                acc += v.sample(p, x, self.sweep, self.base_freq);
             }
         }
         (acc * self.master).clamp(-1.0, 1.0)
     }
 
-    /// Render the complete waveform as an SVG string.
-    ///
-    /// Every sample is included as a point on a white polyline over a black
-    /// background. The SVG is 1200×200 pixels.
+    /// Render the complete waveform as an SVG string (1200×200, white polyline on black).
     pub fn to_svg(self) -> String {
         let samples: Vec<f32> = self.collect();
         samples_to_svg(&samples)
@@ -164,9 +192,6 @@ fn mix_unit(seed: u64, idx: u64) -> f64 {
 }
 
 /// Render a slice of `f32` samples as an SVG waveform.
-///
-/// Every sample becomes a point on a white polyline over a black background.
-/// The output is a complete 1200×200 SVG document.
 pub fn samples_to_svg(samples: &[f32]) -> String {
     let n = samples.len();
     let width = 1200.0_f32;
@@ -233,10 +258,7 @@ impl Source for Chirp {
     }
 }
 
-/// Produce a 256-bit hash from arbitrary bytes. Not cryptographic; we only
-/// need stability and good avalanche so that small input differences produce
-/// audibly different chirps. Runs four independent FxHash-style passes with
-/// distinct seeds.
+/// Produce a 256-bit hash from arbitrary bytes. Not cryptographic.
 fn hash256(bytes: &[u8]) -> [u8; 32] {
     const SEEDS: [u64; 4] = [
         0xcbf29ce484222325,
@@ -306,7 +328,6 @@ mod tests {
         let expected_points = chirp.total_samples as usize;
         let svg = Chirp::from_hash(HASH_A).to_svg();
         assert!(svg.starts_with("<svg"));
-        // Each sample becomes a point; points are space-separated.
         let start = svg.find("points=\"").unwrap() + 8;
         let end = svg[start..].find('"').unwrap() + start;
         let point_count = svg[start..end].split(' ').count();
