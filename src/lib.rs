@@ -614,6 +614,67 @@ impl Chirp {
         samples_to_svg(&samples)
     }
 
+    /// The chirp's amplitude envelope as a vibration waveform, for driving a phone's haptic motor
+    /// in step with the sound. `rate_hz` is the motor's amplitude update rate (~200 Hz is a good
+    /// default; the LRA smears anything faster, which just reads as texture).
+    ///
+    /// Derivation, deliberately dumb so ALL the flavor survives — the clank, the beating warble, the
+    /// sawtooth chop, the reverb tail all ride thru as texture rather than being averaged away by a
+    /// per-partial envelope model:
+    /// 1. **Abs** the finished clip → `|sample|`, the raw loudness stream.
+    /// 2. **Full-width bin** 44.1 kHz → `rate_hz`: each output step is the MEAN of every input sample
+    ///    in its window (a box-filter anti-alias — NOT nearest-neighbor, which would alias the carrier
+    ///    into garbage). One bin ≈ 44100/rate_hz input samples.
+    /// 3. **Normalize** to the envelope's own peak so the strongest buzz hits motor max.
+    /// 4. **Quantize** to `1..=255` (0 reserved for genuine silence) — the `VibrationEffect.createWaveform`
+    ///    amplitude range. Paired `timings` are all `step_ms = 1000/rate_hz`.
+    ///
+    /// Returns `(timings_ms, amplitudes)`, equal-length, ready for `createWaveform(timings, amplitudes, -1)`.
+    /// Same hash → same envelope (the clip is deterministic), so a contact's haptic matches their chirp.
+    pub fn haptic_waveform(&self, rate_hz: u32) -> (Vec<u32>, Vec<u8>) {
+        let rate_hz = rate_hz.max(1);
+        let bin = (self.sample_rate as f64 / rate_hz as f64).max(1.0);
+        let n = self.rendered.len();
+        if n == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let n_bins = ((n as f64) / bin).ceil() as usize;
+
+        // Full-width binning: mean of |sample| over each bin. Bin edges are floating so the last
+        // (partial) bin averages only the samples it actually covers — no zero-padding tail.
+        let mut env = Vec::with_capacity(n_bins);
+        for b in 0..n_bins {
+            let start = (b as f64 * bin).floor() as usize;
+            let end = (((b + 1) as f64 * bin).floor() as usize).min(n);
+            if end <= start {
+                continue;
+            }
+            let sum: f64 = self.rendered[start..end].iter().map(|s| s.abs() as f64).sum();
+            env.push(sum / (end - start) as f64);
+        }
+
+        let peak = env.iter().fold(0.0f64, |m, &v| m.max(v));
+        let step_ms = (1000.0 / rate_hz as f64).round().max(1.0) as u32;
+        let amplitudes: Vec<u8> = env
+            .iter()
+            .map(|&v| {
+                if peak <= 0.0 {
+                    0
+                } else {
+                    // Normalize to peak, then map (0,1] → 1..=255. Genuine silence stays 0.
+                    let norm = v / peak;
+                    if norm <= 0.0 {
+                        0
+                    } else {
+                        (norm * 255.0).round().clamp(1.0, 255.0) as u8
+                    }
+                }
+            })
+            .collect();
+        let timings = vec![step_ms; amplitudes.len()];
+        (timings, amplitudes)
+    }
+
     /// Play on the default output device, blocking until the clip finishes.
     pub fn play_blocking(self) -> Result<(), String> {
         let mut sink = rodio::DeviceSinkBuilder::open_default_sink()
@@ -817,6 +878,75 @@ mod tests {
     fn play_audible() {
         Chirp::from_hash(HASH_A).play_blocking().expect("playback A failed");
         Chirp::from_hash(HASH_B).play_blocking().expect("playback B failed");
+    }
+
+    #[test]
+    fn haptic_same_hash_same_waveform() {
+        let a = Chirp::from_hash(HASH_A).haptic_waveform(200);
+        let b = Chirp::from_hash(HASH_A).haptic_waveform(200);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn haptic_different_hashes_differ() {
+        let a = Chirp::from_hash(HASH_A).haptic_waveform(200);
+        let b = Chirp::from_hash(HASH_B).haptic_waveform(200);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn haptic_arrays_equal_length_and_stepped() {
+        let (timings, amps) = Chirp::from_hash(HASH_A).haptic_waveform(200);
+        assert_eq!(timings.len(), amps.len(), "createWaveform needs equal-length arrays");
+        assert!(!amps.is_empty());
+        // 200 Hz → 5 ms steps.
+        assert!(timings.iter().all(|&t| t == 5), "all steps should be 1000/rate ms");
+    }
+
+    #[test]
+    fn haptic_bin_count_matches_rate() {
+        // ~200 Hz over the clip's duration ≈ duration_secs * 200 bins (±1 for the partial last bin).
+        let chirp = Chirp::from_hash(HASH_A);
+        let secs = chirp.total_samples as f64 / chirp.sample_rate as f64;
+        let (_, amps) = chirp.haptic_waveform(200);
+        let expected = (secs * 200.0).round() as i64;
+        assert!(
+            (amps.len() as i64 - expected).abs() <= 1,
+            "bins {} should be ~{} for a {:.3}s clip at 200Hz",
+            amps.len(), expected, secs,
+        );
+    }
+
+    #[test]
+    fn haptic_is_binned_not_nearest_neighbor() {
+        // Nearest-neighbor would pick single raw |samples| — mostly near 0 or the sparse peaks, and
+        // it would resample the ±1 CARRIER, so consecutive steps would swing wildly. Full-width
+        // binning averages ~220 samples/bin into a smooth envelope: adjacent steps move gradually and
+        // the whole thing is far from the raw carrier's variance. Assert the envelope is smooth —
+        // mean absolute step-to-step change is small relative to the range.
+        let (_, amps) = Chirp::from_hash(HASH_A).haptic_waveform(200);
+        assert!(amps.len() > 10);
+        let mut jumps = 0u64;
+        let mut big = 0u64;
+        for w in amps.windows(2) {
+            let d = (w[1] as i32 - w[0] as i32).unsigned_abs();
+            jumps += 1;
+            if d > 128 {
+                big += 1;
+            }
+        }
+        // A binned envelope almost never jumps more than half-scale between adjacent 5ms steps;
+        // a nearest-neighbor carrier resample would do so constantly.
+        assert!(
+            big * 5 < jumps,
+            "too many half-scale jumps ({big}/{jumps}) — looks like carrier aliasing, not binning",
+        );
+    }
+
+    #[test]
+    fn haptic_normalized_to_full_scale() {
+        let (_, amps) = Chirp::from_hash(HASH_A).haptic_waveform(200);
+        assert_eq!(*amps.iter().max().unwrap(), 255, "envelope should hit motor max after normalize");
     }
 
     #[test]

@@ -896,7 +896,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -2295,7 +2295,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "spirix"
-version = "0.0.12"
+version = "0.1.1"
 dependencies = [
  "i256",
  "num-complex",
@@ -2599,9 +2599,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vsf"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c7b9a6c25f7b2d1199956c8b95e439a361b1c2fed660323ae847dce7b73d9f"
+version = "0.9.1"
 dependencies = [
  "bitvec",
  "blake3",
