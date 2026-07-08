@@ -18,10 +18,15 @@
 //! a rodio sink, mixer, or player. See the `play` example.
 
 use std::fmt::Write as _;
+#[cfg(feature = "playback")]
 use std::num::NonZero;
+#[cfg(feature = "playback")]
 use std::time::Duration;
 
-use rodio::{ChannelCount, Sample, SampleRate, Source};
+// rodio's `Sample` is an alias for f32; the Iterator impl below uses f32 directly so it stays
+// available without the playback feature (to_svg / haptic / to_wav all need the sample stream).
+#[cfg(feature = "playback")]
+use rodio::{ChannelCount, SampleRate, Source};
 
 const SAMPLE_RATE_HZ: u32 = 44_100;
 
@@ -675,7 +680,47 @@ impl Chirp {
         (timings, amplitudes)
     }
 
+    /// The finished, peak-normalized f32 clip (−1..=1), for a caller that wants the raw samples —
+    /// e.g. to hand to a platform audio API. `sample_rate()` gives the rate. Deterministic per hash.
+    pub fn samples(&self) -> &[f32] {
+        &self.rendered
+    }
+
+    /// The finished clip as a self-contained mono 16-bit PCM WAV (44-byte header + samples), so the
+    /// host app can hand the bytes straight to a platform player (Android MediaPlayer/AudioTrack reads
+    /// this as-is). No extra deps — the header is hand-built. Same hash → byte-identical WAV.
+    pub fn to_wav(&self) -> Vec<u8> {
+        let sr = self.sample_rate;
+        let n = self.rendered.len();
+        let data_len = (n * 2) as u32; // 16-bit mono → 2 bytes/sample
+        let mut out = Vec::with_capacity(44 + n * 2);
+
+        // RIFF header
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes()); // chunk size = 36 + data
+        out.extend_from_slice(b"WAVE");
+        // fmt subchunk (PCM)
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // subchunk1 size (16 for PCM)
+        out.extend_from_slice(&1u16.to_le_bytes()); // audio format = 1 (PCM)
+        out.extend_from_slice(&1u16.to_le_bytes()); // channels = 1 (mono)
+        out.extend_from_slice(&sr.to_le_bytes()); // sample rate
+        out.extend_from_slice(&(sr * 2).to_le_bytes()); // byte rate = sr * channels * bytes/sample
+        out.extend_from_slice(&2u16.to_le_bytes()); // block align = channels * bytes/sample
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        // data subchunk
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        for &s in &self.rendered {
+            // f32 −1..=1 → i16, clamped so a sample sitting exactly at ±1 doesn't wrap.
+            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
     /// Play on the default output device, blocking until the clip finishes.
+    #[cfg(feature = "playback")]
     pub fn play_blocking(self) -> Result<(), String> {
         let mut sink = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| format!("no default audio output device: {e}"))?;
@@ -689,6 +734,7 @@ impl Chirp {
 
     /// Fire-and-forget playback on a detached thread — the notification-app entry point.
     /// Errors (e.g. no audio device) are logged to stderr, never fatal: a missing sound card must not take the host app down.
+    #[cfg(feature = "playback")]
     pub fn play_detached(self) {
         std::thread::spawn(move || {
             if let Err(e) = self.play_blocking() {
@@ -762,9 +808,9 @@ pub fn samples_to_svg(samples: &[f32]) -> String {
 }
 
 impl Iterator for Chirp {
-    type Item = Sample;
+    type Item = f32;
 
-    fn next(&mut self) -> Option<Sample> {
+    fn next(&mut self) -> Option<f32> {
         if self.cursor >= self.total_samples {
             return None;
         }
@@ -780,6 +826,7 @@ impl Iterator for Chirp {
     }
 }
 
+#[cfg(feature = "playback")]
 impl Source for Chirp {
     fn current_span_len(&self) -> Option<usize> {
         Some((self.total_samples - self.cursor) as usize)
@@ -874,6 +921,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "playback")]
     #[ignore] // requires audio output — run with: cargo test -- --ignored play_audible
     fn play_audible() {
         Chirp::from_hash(HASH_A).play_blocking().expect("playback A failed");
@@ -947,6 +995,37 @@ mod tests {
     fn haptic_normalized_to_full_scale() {
         let (_, amps) = Chirp::from_hash(HASH_A).haptic_waveform(200);
         assert_eq!(*amps.iter().max().unwrap(), 255, "envelope should hit motor max after normalize");
+    }
+
+    #[test]
+    fn samples_match_rendered_length() {
+        let chirp = Chirp::from_hash(HASH_A);
+        assert_eq!(chirp.samples().len(), chirp.total_samples as usize);
+        assert!(!chirp.samples().is_empty());
+    }
+
+    #[test]
+    fn wav_header_is_valid_pcm_mono() {
+        let chirp = Chirp::from_hash(HASH_A);
+        let wav = chirp.to_wav();
+        let n = chirp.samples().len();
+        // Header + 2 bytes/sample (16-bit mono).
+        assert_eq!(wav.len(), 44 + n * 2);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1, "PCM format");
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1, "mono");
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), chirp.sample_rate);
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16, "16-bit");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), (n * 2) as u32);
+    }
+
+    #[test]
+    fn wav_is_deterministic() {
+        assert_eq!(Chirp::from_hash(HASH_A).to_wav(), Chirp::from_hash(HASH_A).to_wav());
+        assert_ne!(Chirp::from_hash(HASH_A).to_wav(), Chirp::from_hash(HASH_B).to_wav());
     }
 
     #[test]

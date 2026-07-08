@@ -10,7 +10,10 @@ keywords = ["audio", "notification", "procedural", "synthesis"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-rodio = { version = "0.22", default-features = false, features = ["playback"] }
+# Playback stack — optional so synthesis-only consumers (photon on Android: derive WAV + haptic, let
+# the platform play it) can depend on chirp without dragging rodio into the NDK build. Default-on so
+# desktop `play_blocking`/`play_detached` keep working with a bare `chirp = { path }`.
+rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }
 # Named-channel derivation: every aesthetic parameter is blake3(channel_name ‖ digest) — see lib.rs channel().
 blake3 = "1"
 
@@ -20,9 +23,24 @@ blake3 = "1"
 fluor = { path = "../fluor", features = ["host-winit"], optional = true }
 
 [features]
-tune = ["dep:fluor"]
+default = ["playback"]
+# Audio playback via rodio (desktop). Off → synthesis + to_wav + haptic_waveform only, no rodio dep.
+playback = ["dep:rodio"]
+tune = ["dep:fluor", "playback"]
+
+# The default dev harness plays audio → needs playback. Declared explicitly so --no-default-features
+# (the synthesis-only Android config) doesn't try to compile it against an absent rodio.
+[[bin]]
+name = "chirp"
+path = "src/main.rs"
+required-features = ["playback"]
 
 [[bin]]
 name = "tune"
 path = "src/bin/tune.rs"
 required-features = ["tune"]
+
+# play.rs plays audio (rodio) → gated; plot.rs only renders SVG → builds without playback.
+[[example]]
+name = "play"
+required-features = ["playback"]
