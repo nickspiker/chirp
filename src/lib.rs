@@ -645,7 +645,7 @@ impl Chirp {
         }
         let n_bins = ((n as f64) / bin).ceil() as usize;
 
-        // Full-width binning: mean of |sample| over each bin. Bin edges are floating so the last
+        // Full-width binning: mean of sample² (power) over each bin. Bin edges are floating so the last
         // (partial) bin averages only the samples it actually covers — no zero-padding tail.
         let mut env = Vec::with_capacity(n_bins);
         for b in 0..n_bins {
@@ -654,7 +654,7 @@ impl Chirp {
             if end <= start {
                 continue;
             }
-            let sum: f64 = self.rendered[start..end].iter().map(|s| s.abs() as f64).sum();
+            let sum: f64 = self.rendered[start..end].iter().map(|s| (*s as f64) * (*s as f64)).sum();
             env.push(sum / (end - start) as f64);
         }
 
