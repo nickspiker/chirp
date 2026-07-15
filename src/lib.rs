@@ -74,6 +74,12 @@ pub struct BellParams {
     pub clank: f64,
     /// Sub-octave hum partial (0.5×f₀, rings 1.5× longer than the fundamental) — church-bell undertone.
     pub hum: f64,
+    /// Phase-mod depth β in sin(θ + β·sin(2θ)) — the DX7 electric-bell sound. 0 = acoustic, 1 = full electric.
+    /// Also alias-guarded per partial (sidebands stay under Nyquist).
+    pub fm: f64,
+    /// Swept-sine "zap" transient: a 3-octave exponential sweep to/from the fundamental over ~25 ms (direction is a per-bell seed draw).
+    /// The laser/droid vocabulary, where clank is the hammer's.
+    pub blip: f64,
 }
 
 /// Post-chain macro parameters, each in `0..1`. All are plain numbers — the chain has no runtime randomness, so equal params + seed give bit-identical output.
@@ -91,6 +97,9 @@ pub struct PostParams {
     pub resonance: f64,
     /// Reverb wet mix — the ambiance floor. 0 bypasses the reverb entirely.
     pub wet: f64,
+    /// Ring-mod depth on the dry voice (before the room): ×(1−d + d·sin(2π·f_rm·t)), f_rm seed-drawn 40..226 Hz.
+    /// Even shallow depth reads retro-futurist metallic (the Dalek patina).
+    pub ring: f64,
 }
 
 /// Feedback comb: `y[n] = buf[n-D]`, `buf[n] = x + y·g`. The echo line and the tuned harmonic resonators.
@@ -264,6 +273,12 @@ struct Strike {
     /// Hammer noise burst: amplitude, and the seed the per-sample noise hashes from.
     clank: f64,
     clank_seed: u64,
+    /// This bell's fundamental (Hz) — anchor for the blip sweep.
+    f0: f64,
+    /// Electric voice knobs, locked across the chime like the other instrument-identity params: phase-mod depth, swept-blip amount, and the blip's seed-drawn sweep direction (sign: ≥0 sweeps up from f₀, <0 falls onto it).
+    fm: f64,
+    blip: f64,
+    blip_dir: f64,
     /// This bell's sawtooth-gate randoms `[r0, r1, r2]` in `-1..1` (rate stretch, phase offset, duty bias).
     saw: [f64; 3],
     /// This bell's sounding life in seconds (4τ of its slowest mode) — the gate's x runs 0..1 over it.
@@ -288,9 +303,14 @@ impl Strike {
             let u = x - 1.0;
             let u2 = u * u;
             let env = u2 * (1.0 - u2).max(0.0).sqrt() * 2.598_076_211_353_316;
-            let a = (std::f64::consts::TAU * q.freq * t).sin();
+            // Alias guard: FM sidebands extend the partial's bandwidth, so the depth fades back toward pure sine as the partial climbs.
+            let beta = self.fm * 2.5 * (3000.0 / q.freq).min(1.0);
+            let theta = std::f64::consts::TAU * q.freq * t;
+            // Phase mod at 2:1 — sin(θ + β·sin(2θ)), the classic electric-bell operator stack.
+            let a = (theta + (theta * 2.0).sin() * beta).sin();
             let s = if q.det != 0.0 {
-                (a + (std::f64::consts::TAU * (q.freq + q.det) * t).sin()) * 0.5
+                let theta2 = std::f64::consts::TAU * (q.freq + q.det) * t;
+                (a + (theta2 + (theta2 * 2.0).sin() * beta).sin()) * 0.5
             } else {
                 a
             };
@@ -300,6 +320,21 @@ impl Strike {
         if self.clank > 0.0 && t < 0.02 {
             let n = (t * SAMPLE_RATE_HZ as f64) as u64;
             acc += mix_unit(self.clank_seed, 700 + n) * self.clank * 0.8 * (-t / 0.004).exp();
+        }
+        // Zap: swept sine, 3 exponential octaves to/from f₀ over 25 ms (direction seed-drawn).
+        // Envelope decays fast AND is pinned to zero at the window edge — no cutoff click.
+        if self.blip > 0.0 && t < 0.025 {
+            const T_BLIP: f64 = 0.025;
+            let (f1, f2) = if self.blip_dir >= 0.0 {
+                (self.f0, self.f0 * 8.0)
+            } else {
+                (self.f0 * 8.0, self.f0)
+            };
+            let r = f2 / f1;
+            let tt = t / T_BLIP;
+            // Constant-Q exponential sweep: phase = 2π·f1·T/ln r · (r^(t/T) − 1).
+            let phase = std::f64::consts::TAU * f1 * T_BLIP / r.ln() * (r.powf(tt) - 1.0);
+            acc += phase.sin() * self.blip * 0.9 * (-t / 0.006).exp() * (1.0 - tt);
         }
         // Per-bell sawtooth gate, x ∈ 0..1 over THIS bell's sounding life (the formula's own +1 shifts the exponent to 4..8):
         // (tanh(sin(2^((x·(1+r0/4) + 1 + r1/16)·4))·4 + r2·2) + 1)/2
@@ -319,6 +354,9 @@ pub struct ChimeParams {
     pub spacing: f64,
     /// How much the three castings differ: scales each bell's per-partial jitter. 0 = identical copies, 1 = clearly individual bells.
     pub spread: f64,
+    /// Arpeggiation: morphs the ±20 ms scatter flam into a deliberate ascending ladder (root → 4/3 → 3/2 at 45 ms steps).
+    /// 1 reads as "computer acknowledgment", not "bell".
+    pub arp: f64,
 }
 
 /// A deterministic notification chime: three matched modal bells in harmony (shared
@@ -336,6 +374,9 @@ pub struct Chirp {
     dry_samples: u32,
     /// Sounding frequencies of the root bell's three lowest partials — the post resonators tune to these.
     res_freqs: [f64; 3],
+    /// Ring-mod on the dry voice (depth 0..1, carrier Hz) — applied before the room so the resonators/reverb ring the modulated tone, not a clean bell with a warble pasted on.
+    ring_depth: f64,
+    ring_freq: f64,
     /// The finished clip: rendered in f64 with NO clamping, peak-normalized to full scale, then trimmed to the span that actually sounds (every patch's lead-in delay and ring-out length differ).
     /// Built by `finalize()` at construction; the Iterator/Source impls just stream it.
     rendered: Vec<f32>,
@@ -404,40 +445,44 @@ fn build_partials(p: &BellParams, f0: f64, prefix: &str, digest: &[u8; 32], jitt
 impl Chirp {
     /// Build a chime deterministically from a 32-byte digest (e.g. `spaghettify(theirs ‖ mine)`): bells, harmony, timing, and room all derive from named blake3 channels of it.
     pub fn from_hash(hash: [u8; 32]) -> Self {
-        let u = |name: &str| channel_unit(name, &hash);
-        // Desk-bell ranges: small, bright, short.
-        // Ranges from the ear-derived 29-keeper tuning session: decay and room under 0.5; everything else survived full-range listening.
+        // Every param is a channel mapped into its ear-locked range (July 2026 electric tuning session,
+        // zone sliders in the tune bin; supersedes the 29-keeper acoustic ranges). The tuner's RANGES
+        // table mirrors this exactly — keep them in sync when re-tuning.
+        let r = |name: &str, lo: f64, hi: f64| lo + channel_unit(name, &hash) * (hi - lo);
         let bell = BellParams {
-            pitch: u("pitch"),
-            material: u("material"),
-            decay: u("decay") * 0.5,
-            slope: u("slope"),
-            strike: u("strike"),
-            inharm: u("inharm"),
-            shimmer: u("shimmer"),
-            partials: u("partials"),
-            clank: u("clank"),
-            hum: u("hum"),
+            pitch: r("pitch", 0.42, 0.90),
+            material: r("material", 0.56, 0.79),
+            decay: r("decay", 0.10, 0.49),
+            slope: r("slope", 0.0, 1.0),
+            strike: r("strike", 0.0, 1.0),
+            inharm: r("inharm", 0.45, 0.95),
+            shimmer: r("shimmer", 0.0, 1.0),
+            partials: r("partials", 0.0, 1.0),
+            clank: r("clank", 0.0, 1.0),
+            hum: r("hum", 0.0, 1.0),
+            fm: r("fm", 0.40, 0.80),
+            blip: r("blip", 0.0, 1.0),
         };
         let chime = ChimeParams {
-            spacing: 0.3 + u("chime spacing") * 0.7,
-            spread: 0.3 + u("chime spread") * 0.6,
+            spacing: r("chime spacing", 0.0, 1.0),
+            spread: r("chime spread", 0.0, 1.0),
+            arp: r("chime arp", 0.0, 0.60),
         };
-        // Small mostly-dry room: enough ambiance to place the chime in space without haunting it.
         let post = PostParams {
-            room: u("room size") * 0.5,
-            damp: u("room damp"),
-            echo_time: u("echo time"),
-            echo_gain: u("echo gain") * 0.2,
-            resonance: u("resonance") * 0.25,
-            wet: 0.06 + u("wet") * 0.16,
+            room: r("room size", 0.05, 0.16),
+            damp: r("room damp", 0.38, 1.0),
+            echo_time: r("echo time", 0.18, 0.45),
+            echo_gain: r("echo gain", 0.21, 0.58),
+            resonance: r("resonance", 0.60, 1.0),
+            wet: r("wet", 0.38, 0.78),
+            ring: r("ring", 0.22, 0.77),
         };
         Self::from_chime(bell, chime, &hash).with_post(post, &hash)
     }
 
     /// Build a single bell (a chime with zero spacing and one strike) — kept for API symmetry and quick tests.
     pub fn from_bell(p: BellParams, digest: &[u8; 32]) -> Self {
-        Self::from_chime(p, ChimeParams { spacing: 0.0, spread: 0.0 }, digest)
+        Self::from_chime(p, ChimeParams { spacing: 0.0, spread: 0.0, arp: 0.0 }, digest)
     }
 
     /// Build a three-bell chime from explicit macro knobs — the tuning-UI entry point.
@@ -471,12 +516,19 @@ impl Chirp {
                 .fold(0.0f64, f64::max)
                 .max(0.01)
                 * 4.0;
+            // Arp morphs the scatter draw toward a deliberate ascending ladder (45 ms steps).
+            let arp = c.arp.clamp(0.0, 1.0);
+            let scatter = channel(&format!("{bp}offset"), digest) * window;
             strikes.push(Strike {
-                offset: channel(&format!("{bp}offset"), digest) * window,
+                offset: scatter * (1.0 - arp) + k as f64 * 0.045 * arp,
                 partials,
                 level,
                 clank: p.clank.clamp(0.0, 1.0),
                 clank_seed: channel_u64(&format!("{bp}clank noise"), digest),
+                f0: f_root * ratio,
+                fm: p.fm.clamp(0.0, 1.0),
+                blip: p.blip.clamp(0.0, 1.0),
+                blip_dir: channel(&format!("{bp}blip dir"), digest),
                 saw: [
                     channel(&format!("{bp}saw rate"), digest),
                     channel(&format!("{bp}saw phase"), digest),
@@ -518,6 +570,8 @@ impl Chirp {
             post: None,
             dry_samples: total_samples,
             res_freqs,
+            ring_depth: 0.0,
+            ring_freq: 0.0,
             rendered: Vec::new(),
         }
         .finalize()
@@ -534,6 +588,9 @@ impl Chirp {
             .min(0.9);
         self.total_samples = self.dry_samples + (SAMPLE_RATE_HZ as f64 * tail_secs) as u32;
         self.post = Some(Post::new(params, digest, self.res_freqs));
+        self.ring_depth = params.ring.clamp(0.0, 1.0);
+        // Carrier 40..226 Hz, exp-mapped and seed-drawn: low enough to read as metallic sidebands, not pitch.
+        self.ring_freq = 40.0 * 2f64.powf(channel_unit("ring freq", digest) * 2.5);
         self.finalize()
     }
 
@@ -558,11 +615,15 @@ impl Chirp {
         let sr = self.sample_rate as f64;
         let mut raw = Vec::with_capacity(n);
         for i in 0..n {
-            let dry = if (i as u32) < self.dry_samples {
+            let mut dry = if (i as u32) < self.dry_samples {
                 self.signal(i as f64 / sr)
             } else {
                 0.0
             };
+            if self.ring_depth > 0.0 {
+                let lfo = (std::f64::consts::TAU * self.ring_freq * i as f64 / sr).sin();
+                dry *= 1.0 - self.ring_depth + self.ring_depth * lfo;
+            }
             let out = match &mut self.post {
                 Some(p) => p.process(dry),
                 None => dry,

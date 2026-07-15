@@ -1,8 +1,8 @@
 //! Bell tuning UI — modal-synthesis knobs + room, one slider column.
 //!
 //! Waveform on top (rendered buffer, post chain included, supersampled with stratified jitter, green = exact zero).
-//! Ten bell knobs (pitch, material, decay, slope, strike, inharm, shimmer, partials, clank, hum), six room knobs (room, walls, echo time/feedback, resonance, wet).
-//! ⚄ random rolls everything; `n` rerolls the per-partial jitter seed at the same knob settings; ▶ play (or Enter) renders + plays.
+//! Each knob row is three sliders: ⚄-zone min, the knob itself, ⚄-zone max — drag the outer pair to tune the randomizer's range live.
+//! ⚄ random rolls every knob inside its zone; `n` rerolls the per-partial jitter seed at the same knob settings; ▶ play (or Enter / `p`) renders + plays; `l` logs the knobs; ⎙ ranges prints the zone table paste-ready.
 
 use std::num::NonZero;
 
@@ -32,18 +32,48 @@ fn sample_jitter(px: usize, ss: usize) -> f64 {
     (h >> 11) as f64 / (1u64 << 53) as f64
 }
 
-/// Slider order: ten bell knobs, two chime knobs, six room knobs. All 0..1, passed straight thru. Chord is fixed sus4.
-const SLIDER_LABELS: [&str; 18] = [
+/// Slider order: twelve bell knobs, three chime knobs, seven room knobs. All 0..1, passed straight thru. Chord is fixed sus4.
+const SLIDER_LABELS: [&str; 22] = [
     "pitch", "material", "decay", "slope", "strike", "inharm", "shimmer", "partials", "clank",
-    "hum", "spacing", "spread", "room", "walls", "echo·t", "echo·g", "reson", "wet",
+    "hum", "fm", "blip", "spacing", "spread", "arp", "room", "walls", "echo·t", "echo·g",
+    "reson", "wet", "ring",
 ];
 const N_SLIDERS: usize = SLIDER_LABELS.len();
 
-/// Default knob positions: a near-simultaneous sus4 desk-bell chime in a small, mostly-dry room.
+/// Default knob positions: a near-simultaneous sus4 desk-bell chime in a small, mostly-dry room, fm centered in its locked band.
 const DEFAULTS: [f32; N_SLIDERS] = [
-    0.5, 0.45, 0.5, 0.4, 0.6, 0.1, 0.2, 0.5, 0.35, 0.1, // bell
-    0.5, 0.5, // chime: ±10 ms scatter, individual castings
+    0.5, 0.45, 0.5, 0.4, 0.6, 0.1, 0.2, 0.5, 0.35, 0.1, // bell (acoustic)
+    0.6, 0.5, // bell (electric): fm, blip
+    0.5, 0.5, 0.0, // chime: ±10 ms scatter, individual castings, no arp
     0.3, 0.5, 0.2, 0.05, 0.1, 0.12, // room
+    0.0, // room (electric): ring
+];
+
+/// ⚄-zone presets — the min/max flanking sliders start here; the roll draws inside whatever they currently read.
+/// Knob sliders stay full 0..1 for manual exploration. These are the SHIPPED ranges (July 2026 electric session) and mirror `Chirp::from_hash` exactly — keep them in sync when re-tuning.
+const RANGES: [(f32, f32); N_SLIDERS] = [
+    (0.42, 0.90), // pitch
+    (0.56, 0.79), // material
+    (0.10, 0.49), // decay
+    (0.00, 1.00), // slope
+    (0.00, 1.00), // strike
+    (0.45, 0.95), // inharm
+    (0.00, 1.00), // shimmer
+    (0.00, 1.00), // partials
+    (0.00, 1.00), // clank
+    (0.00, 1.00), // hum
+    (0.40, 0.80), // fm
+    (0.00, 1.00), // blip
+    (0.00, 1.00), // spacing
+    (0.00, 1.00), // spread
+    (0.00, 0.60), // arp
+    (0.05, 0.16), // room
+    (0.38, 1.00), // walls
+    (0.18, 0.45), // echo·t
+    (0.21, 0.58), // echo·g
+    (0.60, 1.00), // reson
+    (0.38, 0.78), // wet
+    (0.22, 0.77), // ring
 ];
 
 const PINK:         u32 = 0xFF00_0000 | (0x00FF_8080 ^ 0x00FF_FFFF);
@@ -60,12 +90,17 @@ struct TuneApp {
     title: String,
     chrome: DefaultChrome,
     sliders: Vec<Slider>,
+    /// ⚄-zone bounds flanking each knob: min slider on the left, max on the right. Randomizer draws inside them.
+    lo_sliders: Vec<Slider>,
+    hi_sliders: Vec<Slider>,
     play_button: Button,
     random_button: Button,
+    ranges_button: Button,
     rng: u64,
     hit_counter: HitId,
     current_focus: Option<HitId>,
-    dragging: Option<usize>,
+    /// (vec, row): vec 0 = knob, 1 = zone min, 2 = zone max.
+    dragging: Option<(usize, usize)>,
     modifiers: fluor::event::ModifiersState,
 
     /// Rendered clip for the current knobs — the plot source and the play buffer.
@@ -92,11 +127,16 @@ impl TuneApp {
         );
 
         let mut sliders = Vec::with_capacity(N_SLIDERS);
+        let mut lo_sliders = Vec::with_capacity(N_SLIDERS);
+        let mut hi_sliders = Vec::with_capacity(N_SLIDERS);
         for i in 0..N_SLIDERS {
             sliders.push(Slider::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, DEFAULTS[i]));
+            lo_sliders.push(Slider::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, RANGES[i].0));
+            hi_sliders.push(Slider::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, RANGES[i].1));
         }
         let play_button   = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "▶ play");
         let random_button = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "⚄ random");
+        let ranges_button = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "⎙ ranges");
 
         let rng = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -107,8 +147,11 @@ impl TuneApp {
             title: "Bell Tune".to_string(),
             chrome,
             sliders,
+            lo_sliders,
+            hi_sliders,
             play_button,
             random_button,
+            ranges_button,
             rng,
             hit_counter,
             current_focus: None,
@@ -137,18 +180,22 @@ impl TuneApp {
             partials: v(7),
             clank: v(8),
             hum: v(9),
+            fm: v(10),
+            blip: v(11),
         };
         let chime = chirp::ChimeParams {
-            spacing: v(10),
-            spread: v(11),
+            spacing: v(12),
+            spread: v(13),
+            arp: v(14),
         };
         let post = chirp::PostParams {
-            room: v(12),
-            damp: v(13),
-            echo_time: v(14),
-            echo_gain: v(15),
-            resonance: v(16),
-            wet: v(17),
+            room: v(15),
+            damp: v(16),
+            echo_time: v(17),
+            echo_gain: v(18),
+            resonance: v(19),
+            wet: v(20),
+            ring: v(21),
         };
         let synth =
             chirp::Chirp::from_chime(bell, chime, &self.digest).with_post(post, &self.digest);
@@ -202,14 +249,18 @@ impl TuneApp {
         self.row_pitch = slider_area_h / N_SLIDERS as Coord;
         let band_h = (bw * 1.1).max(10.0).min(self.row_pitch * 0.9);
 
-        // Horizontal: labels 3%..15%, slider 16%..84%, value at 86%.
-        let slider_left = w * 0.16;
-        let slider_right = w * 0.84;
-        let slider_w = slider_right - slider_left;
-        let slider_cx = slider_left + slider_w * 0.5;
-        for (i, s) in self.sliders.iter_mut().enumerate() {
+        // Horizontal: label 3%, min-value 10.5%, zone-min 14%..21.5%, knob 23%..70%, zone-max 71.5%..79%, max-value 79.5%, knob value 83.5%.
+        let lo_cx = w * 0.1775;
+        let lo_w = w * 0.075;
+        let knob_left = w * 0.23;
+        let knob_w = w * 0.47;
+        let knob_cx = knob_left + knob_w * 0.5;
+        let hi_cx = w * 0.7525;
+        for i in 0..N_SLIDERS {
             let cy = self.slider_area_top + (i as Coord + 0.5) * self.row_pitch;
-            s.set_rect(slider_cx, cy, slider_w, band_h);
+            self.lo_sliders[i].set_rect(lo_cx, cy, lo_w, band_h * 0.8);
+            self.sliders[i].set_rect(knob_cx, cy, knob_w, band_h);
+            self.hi_sliders[i].set_rect(hi_cx, cy, lo_w, band_h * 0.8);
         }
 
         let btn_w = bw * 7.0;
@@ -221,6 +272,9 @@ impl TuneApp {
         self.random_button
             .set_rect(w - margin - btn_w * 1.5 - bw * 0.5, btn_cy, btn_w, btn_h);
         self.random_button.set_font_size(bw * 0.9);
+        self.ranges_button
+            .set_rect(w - margin - btn_w * 2.5 - bw * 1.0, btn_cy, btn_w, btn_h);
+        self.ranges_button.set_font_size(bw * 0.9);
     }
 
     /// Next uniform in `0..1` from the UI RNG (splitmix64 churn).
@@ -232,29 +286,45 @@ impl TuneApp {
         ((z ^ (z >> 31)) >> 40) as f32 / (1u32 << 24) as f32
     }
 
-    /// Poll every slider's change counter; mark the clip dirty if any moved.
+    /// Poll every slider's change counter. Knob moves dirty the clip; zone moves only need a redraw (they shape the NEXT ⚄ roll, not the current sound).
     fn poll_slider_changes(&mut self) -> bool {
         let mut changed = false;
         for s in &mut self.sliders {
             if s.take_change() {
                 changed = true;
+                self.samples_dirty = true;
             }
         }
-        if changed {
-            self.samples_dirty = true;
+        for s in self.lo_sliders.iter_mut().chain(self.hi_sliders.iter_mut()) {
+            if s.take_change() {
+                changed = true;
+            }
         }
         changed
     }
 
+    /// Row `i`'s ⚄ zone from the live flanking sliders, order-normalized so a crossed pair still works.
+    fn zone(&self, i: usize) -> (f32, f32) {
+        let a = self.lo_sliders[i].value();
+        let b = self.hi_sliders[i].value();
+        (a.min(b), a.max(b))
+    }
+
     /// Poll both buttons; fires their actions. Called after any dispatch that could have clicked them.
     fn poll_buttons(&mut self, ctx: &mut Context) {
+        if self.ranges_button.take_click() {
+            // Paste-ready RANGES table from the live zone sliders.
+            println!("const RANGES: [(f32, f32); N_SLIDERS] = [");
+            for i in 0..N_SLIDERS {
+                let (lo, hi) = self.zone(i);
+                println!("    ({lo:.2}, {hi:.2}), // {}", SLIDER_LABELS[i]);
+            }
+            println!("];");
+        }
         if self.random_button.take_click() {
             for i in 0..N_SLIDERS {
-                let mut v = self.next_rand();
-                // Ear-derived limits (29-keeper session): decay and room stay under 0.5.
-                if SLIDER_LABELS[i] == "decay" || SLIDER_LABELS[i] == "room" {
-                    v *= 0.5;
-                }
+                let (lo, hi) = self.zone(i);
+                let v = lo + self.next_rand() * (hi - lo);
                 self.sliders[i].set_value(v);
             }
             self.poll_slider_changes();
@@ -315,19 +385,30 @@ impl TuneApp {
                 ctx.window.request_redraw();
                 return EventResponse::Handled;
             }
-            // `p` = print the current knobs to stdout as paste-ready param blocks.
+            // `p` = play (mirrors Enter) — reachable with the left hand while the right drags sliders.
             if c.eq_ignore_ascii_case("p") {
+                if self.samples_dirty {
+                    self.rebuild_samples();
+                }
+                self.play();
+                return EventResponse::Handled;
+            }
+            // `l` = log the current knobs to stdout as paste-ready param blocks.
+            if c.eq_ignore_ascii_case("l") {
                 let v = |i: usize| self.sliders[i].value();
                 println!(
-                    "BellParams {{ pitch: {:.3}, material: {:.3}, decay: {:.3}, slope: {:.3}, strike: {:.3}, inharm: {:.3}, shimmer: {:.3}, partials: {:.3}, clank: {:.3}, hum: {:.3} }}",
-                    v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(9)
+                    "BellParams {{ pitch: {:.3}, material: {:.3}, decay: {:.3}, slope: {:.3}, strike: {:.3}, inharm: {:.3}, shimmer: {:.3}, partials: {:.3}, clank: {:.3}, hum: {:.3}, fm: {:.3}, blip: {:.3} }}",
+                    v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7), v(8), v(9), v(10), v(11)
                 );
-                println!("ChimeParams {{ spacing: {:.3}, spread: {:.3} }}", v(10), v(11));
+                println!(
+                    "ChimeParams {{ spacing: {:.3}, spread: {:.3}, arp: {:.3} }}",
+                    v(12), v(13), v(14)
+                );
                 let digest_hex: String =
                     self.digest.iter().map(|b| format!("{b:02x}")).collect();
                 println!(
-                    "PostParams {{ room: {:.3}, damp: {:.3}, echo_time: {:.3}, echo_gain: {:.3}, resonance: {:.3}, wet: {:.3} }}  digest: {digest_hex}",
-                    v(12), v(13), v(14), v(15), v(16), v(17)
+                    "PostParams {{ room: {:.3}, damp: {:.3}, echo_time: {:.3}, echo_gain: {:.3}, resonance: {:.3}, wet: {:.3}, ring: {:.3} }}  digest: {digest_hex}",
+                    v(15), v(16), v(17), v(18), v(19), v(20), v(21)
                 );
                 return EventResponse::Handled;
             }
@@ -427,11 +508,15 @@ impl TuneApp {
 
 impl Container for TuneApp {
     fn visit(&mut self, f: &mut dyn FnMut(&mut dyn Widget)) {
-        for s in &mut self.sliders {
-            f(s);
+        // Row-wise: min, knob, max — so Tab walks each row left to right.
+        for i in 0..self.sliders.len() {
+            f(&mut self.lo_sliders[i]);
+            f(&mut self.sliders[i]);
+            f(&mut self.hi_sliders[i]);
         }
         f(&mut self.play_button);
         f(&mut self.random_button);
+        f(&mut self.ranges_button);
         self.chrome.visit(f);
     }
 }
@@ -465,8 +550,12 @@ impl FluorApp for TuneApp {
             Event::CursorMoved { .. } => {
                 let x = ctx.cursor_x;
                 let y = ctx.cursor_y;
-                if let Some(i) = self.dragging {
-                    self.sliders[i].set_value_from_x(x);
+                if let Some((vec_id, i)) = self.dragging {
+                    match vec_id {
+                        0 => self.sliders[i].set_value_from_x(x),
+                        1 => self.lo_sliders[i].set_value_from_x(x),
+                        _ => self.hi_sliders[i].set_value_from_x(x),
+                    }
                     if self.poll_slider_changes() {
                         ctx.window.request_redraw();
                     }
@@ -474,7 +563,7 @@ impl FluorApp for TuneApp {
                 }
                 let new_hit = self.chrome.hit_at(x, y);
                 let mut changed = self.chrome.set_hover(new_hit);
-                for btn in [&mut self.play_button, &mut self.random_button] {
+                for btn in [&mut self.play_button, &mut self.random_button, &mut self.ranges_button] {
                     let want = new_hit == btn.hit_id();
                     if btn.is_hovered() != want {
                         btn.set_hovered(want);
@@ -513,7 +602,23 @@ impl FluorApp for TuneApp {
                         }
                     });
                     self.change_focus(if focusable { Some(hit_id) } else { None }, ctx);
-                    self.dragging = self.sliders.iter().position(|s| s.hit_id() == hit_id);
+                    self.dragging = self
+                        .sliders
+                        .iter()
+                        .position(|s| s.hit_id() == hit_id)
+                        .map(|i| (0, i))
+                        .or_else(|| {
+                            self.lo_sliders
+                                .iter()
+                                .position(|s| s.hit_id() == hit_id)
+                                .map(|i| (1, i))
+                        })
+                        .or_else(|| {
+                            self.hi_sliders
+                                .iter()
+                                .position(|s| s.hit_id() == hit_id)
+                                .map(|i| (2, i))
+                        });
                     if self.poll_slider_changes() {
                         ctx.window.request_redraw();
                     }
@@ -522,8 +627,7 @@ impl FluorApp for TuneApp {
                     return response;
                 }
 
-                let edge =
-                    chrome::get_resize_edge(ctx.viewport.width_px, ctx.viewport.height_px, x, y);
+                let edge = chrome::get_resize_edge(ctx.viewport, x, y);
                 if edge != ResizeEdge::None {
                     return EventResponse::StartResize(edge);
                 }
@@ -599,14 +703,13 @@ impl FluorApp for TuneApp {
         let span = ctx.viewport.effective_span();
         let font_size = (span / 52.0).max(10.0);
         for i in 0..N_SLIDERS {
-            {
-                let s = &mut self.sliders[i];
+            for s in [&mut self.lo_sliders[i], &mut self.sliders[i], &mut self.hi_sliders[i]] {
                 let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
                 let id = s.hit_id();
                 s.render_content_into(&mut canvas, Some(&mut self.chrome.hit_test_map), id);
             }
             let s = &self.sliders[i];
-            let bbox = s.bbox();
+            let bbox = self.hi_sliders[i].bbox();
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             ctx.text.draw_text_left_u32(
                 &mut canvas,
@@ -621,11 +724,41 @@ impl FluorApp for TuneApp {
                 None,
                 None,
             );
+            // Numerics: zone min left of its slider, zone max right of its slider, knob value at the far right.
+            let zone_font = font_size * 0.85;
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            ctx.text.draw_text_left_u32(
+                &mut canvas,
+                &format!("{:.2}", self.lo_sliders[i].value()),
+                buf_w as Coord * 0.105,
+                bbox.y + bbox.h * 0.5,
+                zone_font,
+                400,
+                LABEL_COLOUR,
+                "Open Sans",
+                None,
+                None,
+                None,
+            );
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            ctx.text.draw_text_left_u32(
+                &mut canvas,
+                &format!("{:.2}", self.hi_sliders[i].value()),
+                buf_w as Coord * 0.795,
+                bbox.y + bbox.h * 0.5,
+                zone_font,
+                400,
+                LABEL_COLOUR,
+                "Open Sans",
+                None,
+                None,
+                None,
+            );
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
             ctx.text.draw_text_left_u32(
                 &mut canvas,
                 &format!("{:.3}", s.value()),
-                bbox.x + bbox.w + font_size,
+                buf_w as Coord * 0.835,
                 bbox.y + bbox.h * 0.5,
                 font_size,
                 400,
@@ -663,6 +796,19 @@ impl FluorApp for TuneApp {
                 id,
             );
         }
+        {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            let id = self.ranges_button.hit_id();
+            self.ranges_button.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                id,
+            );
+        }
 
         // Composite the chrome group (bg fill, titlebar, window controls) UNDER everything painted above.
         self.chrome.flatten_into(target, buf_w, buf_h, None);
@@ -673,11 +819,14 @@ impl FluorApp for TuneApp {
         if self.chrome.owns_hit(hit)
             || hit == self.play_button.hit_id()
             || hit == self.random_button.hit_id()
+            || hit == self.ranges_button.hit_id()
             || self.sliders.iter().any(|s| s.hit_id() == hit)
+            || self.lo_sliders.iter().any(|s| s.hit_id() == hit)
+            || self.hi_sliders.iter().any(|s| s.hit_id() == hit)
         {
             return CursorIcon::Pointer;
         }
-        match chrome::get_resize_edge(ctx.viewport.width_px, ctx.viewport.height_px, x, y) {
+        match chrome::get_resize_edge(ctx.viewport, x, y) {
             ResizeEdge::Top | ResizeEdge::Bottom => CursorIcon::NsResize,
             ResizeEdge::Left | ResizeEdge::Right => CursorIcon::EwResize,
             ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorIcon::NwseResize,
