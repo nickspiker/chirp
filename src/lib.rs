@@ -491,20 +491,124 @@ impl Chirp {
     /// Broken apart per bell: pitch (chord ratios off the root), strike time (spacing × order), channel namespace (each bell its own casting, scaled by `spread`), decay (higher bell rings shorter, physics), and level (root slightly louder, ±4% human jitter).
     /// The root fundamental maps to 1024..2048 Hz — desk bell, not church tower.
     pub fn from_chime(p: BellParams, c: ChimeParams, digest: &[u8; 32]) -> Self {
+        Self::chime_scheduled(p, c, digest, &[(0.0, 1.0)], 1.1)
+    }
+
+    /// The ring: the SAME identity voice as [`from_hash`] — same ear-locked ranges, same castings,
+    /// same room — but struck in a call phrase instead of once: two three-hit bursts ("ring-ring"),
+    /// every hit's onset and level jittered a few percent by its own named channel, all sounding
+    /// into ONE shared post chain. One distinct block, not a chirp layered over anything.
+    ///
+    /// The clip is one cadence; the caller loops it (with silence between repeats if desired)
+    /// until the call is answered. Same digest → same ring, and it audibly IS the contact whose
+    /// messages chirp — just conjugated from "ding" into "answer me".
+    pub fn ring_from_hash(hash: [u8; 32]) -> Self {
+        Self::ring_with_variation(hash, 1.0)
+    }
+
+    /// [`ring_from_hash`] with the per-hit smidgle exposed: `variation` scales how much each hit's
+    /// casting is re-rolled (partial freq/tau/amp nudges thru per-hit channels). 0 = every hit is the
+    /// identical casting (machine repeat); 1 = the production smidgle; >1 exaggerated, for auditioning.
+    pub fn ring_with_variation(hash: [u8; 32], variation: f64) -> Self {
+        // Identical parameter derivation to from_hash — the ring must be the same instrument —
+        // minus the supporting sounds: no hammer clank, no zap blip (18 of either is a mess).
+        let r = |name: &str, lo: f64, hi: f64| lo + channel_unit(name, &hash) * (hi - lo);
+        let bell = BellParams {
+            pitch: r("pitch", 0.42, 0.90),
+            material: r("material", 0.56, 0.79),
+            decay: r("decay", 0.10, 0.49),
+            slope: r("slope", 0.0, 1.0),
+            strike: r("strike", 0.0, 1.0),
+            inharm: r("inharm", 0.45, 0.95),
+            shimmer: r("shimmer", 0.0, 1.0),
+            partials: r("partials", 0.0, 1.0),
+            clank: 0.0,
+            hum: r("hum", 0.0, 1.0),
+            fm: r("fm", 0.40, 0.80),
+            blip: 0.0,
+        };
+        let chime = ChimeParams {
+            spacing: r("chime spacing", 0.0, 1.0),
+            spread: r("chime spread", 0.0, 1.0),
+            arp: r("chime arp", 0.0, 0.60),
+        };
+        let post = PostParams {
+            room: r("room size", 0.05, 0.16),
+            damp: r("room damp", 0.38, 1.0),
+            echo_time: r("echo time", 0.18, 0.45),
+            echo_gain: r("echo gain", 0.21, 0.58),
+            resonance: r("resonance", 0.60, 1.0),
+            wet: r("wet", 0.38, 0.78),
+            ring: r("ring", 0.22, 0.77),
+        };
+
+        // The phrase: 2 bursts × 9 hits — same burst span as the original 3-hit take, tripled
+        // density (a whir rather than a knock). Step and burst gap are digest-drawn once; each hit
+        // then nudges its own onset (±12% of the step) and level (±8%, fading slightly across the
+        // burst) thru named channels — deliberate rhythm, human execution.
+        let step = (0.145 + channel_unit("ring step", &hash) * 0.05) / 3.0;
+        let burst_gap = 0.40 + channel_unit("ring burst gap", &hash) * 0.18;
+        let mut hits = Vec::with_capacity(18);
+        let mut t = 0.0;
+        for b in 0..2 {
+            for i in 0..9 {
+                let dj = channel(&format!("ring b{b} h{i} delay"), &hash) * step * 0.12 * variation;
+                let lj = channel(&format!("ring b{b} h{i} level"), &hash) * 0.08 * variation;
+                let fade = 1.0 - i as f64 / 9.0 * 0.24;
+                hits.push(((t + dj).max(0.0), fade * (1.0 + lj)));
+                t += step;
+            }
+            t += burst_gap;
+        }
+        // Hit envelopes at τ/3 — the auditioned sweet spot (2026-08-29): articulate strikes at whir
+        // density, the shared room supplying the sustain. 1/2 stacked, 1/4 went dry.
+        Self::chime_scheduled_var(bell, chime, &hash, &hits, 3.2, variation, 1.0 / 3.0)
+            .with_post(post, &hash)
+    }
+
+    /// Strike the whole three-bell chime once per `(onset_secs, level)` schedule entry, all into one
+    /// clip. The castings (partials) are built once per bell and shared across hits — one instrument,
+    /// many strikes; only per-hit things (scatter draw, hammer noise stream) get hit-namespaced
+    /// channels. `dry_cap` bounds the dry span in seconds (1.1 for the notification, longer for rings).
+    fn chime_scheduled(
+        p: BellParams,
+        c: ChimeParams,
+        digest: &[u8; 32],
+        hits: &[(f64, f64)],
+        dry_cap: f64,
+    ) -> Self {
+        Self::chime_scheduled_var(p, c, digest, hits, dry_cap, 0.0, 1.0)
+    }
+
+    /// [`chime_scheduled`] plus the per-hit smidgle: `hit_var` scales a per-hit re-roll of every
+    /// partial's frequency (±0.2%, a few cents), decay (±10%), and amplitude (±10%) — each hit is
+    /// the same bell struck by a hand, not a copy-paste. 0 disables it (bit-identical castings).
+    /// `tau_scale` uniformly scales every partial's τ (0.5 = each strike's envelope runs in half
+    /// the time) — the ring's hits are the ding damped, nothing else touched.
+    fn chime_scheduled_var(
+        p: BellParams,
+        c: ChimeParams,
+        digest: &[u8; 32],
+        hits: &[(f64, f64)],
+        dry_cap: f64,
+        hit_var: f64,
+        tau_scale: f64,
+    ) -> Self {
         let f_root = 1024.0 * 2.0f64.powf(p.pitch.clamp(0.0, 1.0)); // 1024..2048 Hz
         // Strike scatter: each bell draws an independent offset in ±(spacing × 20 ms) — near-simultaneous flam, any order.
         let window = c.spacing.clamp(0.0, 1.0) * 0.020;
 
-        let mut strikes = Vec::with_capacity(3);
+        let mut strikes = Vec::with_capacity(3 * hits.len());
         for k in 0..3 {
             let ratio = CHORD[k];
             // Each bell is its own casting: its channel names are prefixed "bell{k} ", so the three draw independent jitters from the one digest.
             let bp = format!("bell{k} ");
             let mut partials = build_partials(&p, f_root * ratio, &bp, digest, c.spread);
-            // Physics: the higher (smaller) bell rings shorter. Scale every mode's tau down by the chord ratio.
-            let tau_scale = 1.0 / ratio.powf(0.75);
+            // Physics: the higher (smaller) bell rings shorter. Scale every mode's tau down by the
+            // chord ratio — then by the caller's envelope scale (the ring damps its hits to half).
+            let bell_tau = tau_scale / ratio.powf(0.75);
             for q in &mut partials {
-                q.tau *= tau_scale;
+                q.tau *= bell_tau;
             }
             // Level: root a touch louder than the harmony bells, ±4% per-strike human jitter.
             let level = (1.0 / ratio.powf(0.3))
@@ -516,26 +620,40 @@ impl Chirp {
                 .fold(0.0f64, f64::max)
                 .max(0.01)
                 * 4.0;
-            // Arp morphs the scatter draw toward a deliberate ascending ladder (45 ms steps).
             let arp = c.arp.clamp(0.0, 1.0);
-            let scatter = channel(&format!("{bp}offset"), digest) * window;
-            strikes.push(Strike {
-                offset: scatter * (1.0 - arp) + k as f64 * 0.045 * arp,
-                partials,
-                level,
-                clank: p.clank.clamp(0.0, 1.0),
-                clank_seed: channel_u64(&format!("{bp}clank noise"), digest),
-                f0: f_root * ratio,
-                fm: p.fm.clamp(0.0, 1.0),
-                blip: p.blip.clamp(0.0, 1.0),
-                blip_dir: channel(&format!("{bp}blip dir"), digest),
-                saw: [
-                    channel(&format!("{bp}saw rate"), digest),
-                    channel(&format!("{bp}saw phase"), digest),
-                    channel(&format!("{bp}saw duty"), digest),
-                ],
-                saw_life,
-            });
+            for (h, &(onset, hit_level)) in hits.iter().enumerate() {
+                // Per-hit namespace suffix. Hit 0 keeps the bare names so a one-hit schedule is
+                // channel-for-channel identical to the original chime — same digest, same ding.
+                let hs = if h == 0 { String::new() } else { format!("hit{h} ") };
+                // The smidgle: re-roll this hit's casting a hair. Hit 0 stays the exact casting.
+                let mut hit_partials = partials.clone();
+                if hit_var > 0.0 && h > 0 {
+                    for (qi, q) in hit_partials.iter_mut().enumerate() {
+                        q.freq *= 1.0 + channel(&format!("{bp}{hs}p{qi} freq"), digest) * 0.002 * hit_var;
+                        q.tau *= 1.0 + channel(&format!("{bp}{hs}p{qi} tau"), digest) * 0.10 * hit_var;
+                        q.amp *= 1.0 + channel(&format!("{bp}{hs}p{qi} amp"), digest) * 0.10 * hit_var;
+                    }
+                }
+                // Arp morphs the scatter draw toward a deliberate ascending ladder (45 ms steps).
+                let scatter = channel(&format!("{bp}{hs}offset"), digest) * window;
+                strikes.push(Strike {
+                    offset: onset + scatter * (1.0 - arp) + k as f64 * 0.045 * arp,
+                    partials: hit_partials,
+                    level: level * hit_level,
+                    clank: p.clank.clamp(0.0, 1.0),
+                    clank_seed: channel_u64(&format!("{bp}{hs}clank noise"), digest),
+                    f0: f_root * ratio,
+                    fm: p.fm.clamp(0.0, 1.0),
+                    blip: p.blip.clamp(0.0, 1.0),
+                    blip_dir: channel(&format!("{bp}blip dir"), digest),
+                    saw: [
+                        channel(&format!("{bp}saw rate"), digest),
+                        channel(&format!("{bp}saw phase"), digest),
+                        channel(&format!("{bp}saw duty"), digest),
+                    ],
+                    saw_life,
+                });
+            }
         }
         // Shift so the earliest strike lands at t = 0 (offsets were drawn in ±window).
         let min_offset = strikes.iter().map(|s| s.offset).fold(f64::MAX, f64::min);
@@ -549,8 +667,8 @@ impl Chirp {
             .flat_map(|s| s.partials.iter().map(|q| q.tau))
             .fold(0.0f64, f64::max);
         let last_offset = strikes.iter().map(|s| s.offset).fold(0.0f64, f64::max);
-        // Dry span capped at ~1.1 s — a desk bell, not a resonating hall.
-        let duration = (last_offset + max_tau * 4.0 + 0.1).clamp(0.2, 1.1);
+        // Dry span capped by the caller: ~1.1 s for the notification (a desk bell, not a resonating hall), longer for ring phrases.
+        let duration = (last_offset + max_tau * 4.0 + 0.1).clamp(0.2, dry_cap);
         let total_samples = (SAMPLE_RATE_HZ as f64 * duration) as u32;
 
         // Resonator targets: the root bell's three lowest sounding partials.
