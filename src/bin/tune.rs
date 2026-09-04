@@ -350,9 +350,10 @@ impl TuneApp {
     }
 
     /// ☎ (or `r`): audition the current digest's production RING — no reroll, so ding and ring A/B the SAME identity (only ⚄ changes the input). Sliders are ignored; the ring derives every knob from the digest exactly as a real caller's does.
+    /// The buffer is fresh here, so dirty goes FALSE — render() must plot THIS, not rebuild the slider chime over it (the bug the first cut shipped).
     fn audition_ring(&mut self, ctx: &mut Context) {
         self.samples = chirp::Chirp::ring_from_hash(self.digest).collect();
-        self.samples_dirty = true;
+        self.samples_dirty = false;
         self.play();
         ctx.window.request_redraw();
     }
@@ -360,7 +361,7 @@ impl TuneApp {
     /// ♪ (or `d`): audition the current digest's production DING (`from_hash`) — the ring's sibling voice, same identity, for the correlate-by-ear comparison. No reroll here either.
     fn audition_ding(&mut self, ctx: &mut Context) {
         self.samples = chirp::Chirp::from_hash(self.digest).collect();
-        self.samples_dirty = true;
+        self.samples_dirty = false;
         self.play();
         ctx.window.request_redraw();
     }
@@ -395,10 +396,10 @@ impl TuneApp {
             return EventResponse::Handled;
         }
         if matches!(kev.logical_key, Key::Named(NamedKey::Enter)) {
-            if self.samples_dirty {
-                self.rebuild_samples();
-            }
+            // Always rebuild: dirty=false can mean the buffer holds a ♪/☎ render, and Enter means the SLIDER chime.
+            self.rebuild_samples();
             self.play();
+            ctx.window.request_redraw();
             return EventResponse::Handled;
         }
         // `n` = reroll the jitter digest: same knobs, sibling instrument.
@@ -420,10 +421,9 @@ impl TuneApp {
             }
             // `p` = play (mirrors Enter) — reachable with the left hand while the right drags sliders.
             if c.eq_ignore_ascii_case("p") {
-                if self.samples_dirty {
-                    self.rebuild_samples();
-                }
+                self.rebuild_samples();
                 self.play();
+                ctx.window.request_redraw();
                 return EventResponse::Handled;
             }
             // `l` = log the current knobs to stdout as paste-ready param blocks.
