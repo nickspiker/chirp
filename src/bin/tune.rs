@@ -2,7 +2,7 @@
 //!
 //! Waveform on top (rendered buffer, post chain included, supersampled with stratified jitter, green = exact zero).
 //! Each knob row is three sliders: ⚄-zone min, the knob itself, ⚄-zone max — drag the outer pair to tune the randomizer's range live.
-//! ⚄ random rolls every knob inside its zone; `n` rerolls the per-partial jitter seed at the same knob settings; ▶ play (or Enter / `p`) renders + plays; `l` logs the knobs; ⎙ ranges prints the zone table paste-ready.
+//! ⚄ random is the ONE input changer: rolls every knob inside its zone AND rerolls the identity digest, then auditions the new rando's ding. ♪ ding (`d`) and ☎ ring (`r`) render + play the CURRENT digest's production voices — a two-press ring↔ding A/B on one identity. `n` rerolls the jitter digest alone; Enter / `p` audition the slider chime; `l` logs the knobs; ⎙ ranges prints the zone table paste-ready.
 
 use std::num::NonZero;
 
