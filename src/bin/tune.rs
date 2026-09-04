@@ -15,6 +15,7 @@ use fluor::host::chrome::{self, HIT_NONE, HitId, ResizeEdge};
 use fluor::host::chrome_widget::DefaultChrome;
 use fluor::host::widget::{self as widget, Container, TabDir, Widget};
 use fluor::pixel::Blend;
+use fluor::text::TextStyle;
 use fluor::widgets::{Button, Slider};
 use fluor::BlendMode;
 
@@ -96,6 +97,7 @@ struct TuneApp {
     play_button: Button,
     random_button: Button,
     ranges_button: Button,
+    ring_button: Button,
     rng: u64,
     hit_counter: HitId,
     current_focus: Option<HitId>,
@@ -137,6 +139,7 @@ impl TuneApp {
         let play_button   = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "▶ play");
         let random_button = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "⚄ random");
         let ranges_button = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "⎙ ranges");
+        let ring_button   = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "☎ ring");
 
         let rng = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -152,6 +155,7 @@ impl TuneApp {
             play_button,
             random_button,
             ranges_button,
+            ring_button,
             rng,
             hit_counter,
             current_focus: None,
@@ -275,6 +279,9 @@ impl TuneApp {
         self.ranges_button
             .set_rect(w - margin - btn_w * 2.5 - bw * 1.0, btn_cy, btn_w, btn_h);
         self.ranges_button.set_font_size(bw * 0.9);
+        self.ring_button
+            .set_rect(w - margin - btn_w * 3.5 - bw * 1.5, btn_cy, btn_w, btn_h);
+        self.ring_button.set_font_size(bw * 0.9);
     }
 
     /// Next uniform in `0..1` from the UI RNG (splitmix64 churn).
@@ -339,6 +346,20 @@ impl TuneApp {
             }
             self.play();
         }
+        if self.ring_button.take_click() {
+            self.audition_ring(ctx);
+        }
+    }
+
+    /// ☎ (or `r`): roll a fresh digest and audition its production RING — sliders are ignored, the ring derives every knob from the digest exactly as a real caller's identity does. Each press is a new rando; the digest prints for reproducibility.
+    fn audition_ring(&mut self, ctx: &mut Context) {
+        self.digest = *blake3::hash(&self.digest).as_bytes();
+        self.samples = chirp::Chirp::ring_from_hash(self.digest).collect();
+        self.samples_dirty = true;
+        let hex: String = self.digest.iter().map(|b| format!("{b:02x}")).collect();
+        println!("ring digest: {hex}");
+        self.play();
+        ctx.window.request_redraw();
     }
 
     fn change_focus(&mut self, new_focus: Option<HitId>, ctx: &mut Context) {
@@ -379,6 +400,11 @@ impl TuneApp {
         }
         // `n` = reroll the jitter digest: same knobs, sibling instrument.
         if let Key::Character(c) = &kev.logical_key {
+            // `r` = roll a rando and audition its ring (mirrors the ☎ button).
+            if c.eq_ignore_ascii_case("r") {
+                self.audition_ring(ctx);
+                return EventResponse::Handled;
+            }
             if c.eq_ignore_ascii_case("n") {
                 self.digest = *blake3::hash(&self.digest).as_bytes();
                 self.samples_dirty = true;
@@ -517,6 +543,7 @@ impl Container for TuneApp {
         f(&mut self.play_button);
         f(&mut self.random_button);
         f(&mut self.ranges_button);
+        f(&mut self.ring_button);
         self.chrome.visit(f);
     }
 }
@@ -563,7 +590,7 @@ impl FluorApp for TuneApp {
                 }
                 let new_hit = self.chrome.hit_at(x, y);
                 let mut changed = self.chrome.set_hover(new_hit);
-                for btn in [&mut self.play_button, &mut self.random_button, &mut self.ranges_button] {
+                for btn in [&mut self.play_button, &mut self.random_button, &mut self.ranges_button, &mut self.ring_button] {
                     let want = new_hit == btn.hit_id();
                     if btn.is_hovered() != want {
                         btn.set_hovered(want);
@@ -663,7 +690,7 @@ impl FluorApp for TuneApp {
         }
     }
 
-    fn damage_rect(&self, viewport: Viewport) -> Option<PixelRect> {
+    fn damage_rect(&mut self, viewport: Viewport) -> Option<PixelRect> {
         let w = viewport.width_px as usize;
         let h = viewport.height_px as usize;
         Some(PixelRect::new(0, 0, w, h))
@@ -711,60 +738,44 @@ impl FluorApp for TuneApp {
             let s = &self.sliders[i];
             let bbox = self.hi_sliders[i].bbox();
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
-            ctx.text.draw_text_left_u32(
+            ctx.text.draw_text_left(
                 &mut canvas,
                 SLIDER_LABELS[i],
                 buf_w as Coord * 0.03,
                 bbox.y + bbox.h * 0.5,
-                font_size,
-                400,
-                LABEL_COLOUR,
-                "Open Sans",
-                None,
+                &TextStyle::new(font_size, LABEL_COLOUR),
                 None,
                 None,
             );
             // Numerics: zone min left of its slider, zone max right of its slider, knob value at the far right.
             let zone_font = font_size * 0.85;
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
-            ctx.text.draw_text_left_u32(
+            ctx.text.draw_text_left(
                 &mut canvas,
                 &format!("{:.2}", self.lo_sliders[i].value()),
                 buf_w as Coord * 0.105,
                 bbox.y + bbox.h * 0.5,
-                zone_font,
-                400,
-                LABEL_COLOUR,
-                "Open Sans",
-                None,
+                &TextStyle::new(zone_font, LABEL_COLOUR),
                 None,
                 None,
             );
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
-            ctx.text.draw_text_left_u32(
+            ctx.text.draw_text_left(
                 &mut canvas,
                 &format!("{:.2}", self.hi_sliders[i].value()),
                 buf_w as Coord * 0.795,
                 bbox.y + bbox.h * 0.5,
-                zone_font,
-                400,
-                LABEL_COLOUR,
-                "Open Sans",
-                None,
+                &TextStyle::new(zone_font, LABEL_COLOUR),
                 None,
                 None,
             );
             let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
-            ctx.text.draw_text_left_u32(
+            ctx.text.draw_text_left(
                 &mut canvas,
                 &format!("{:.3}", s.value()),
                 buf_w as Coord * 0.835,
                 bbox.y + bbox.h * 0.5,
-                font_size,
-                400,
-                LABEL_COLOUR,
-                "Open Sans",
-                None,
+                &TextStyle::new(font_size, LABEL_COLOUR),
                 None,
                 None,
             );
@@ -809,6 +820,19 @@ impl FluorApp for TuneApp {
                 id,
             );
         }
+        {
+            let mut canvas = Canvas::new(target, buf_w, buf_h, ctx.damage);
+            let id = self.ring_button.hit_id();
+            self.ring_button.render_content_into(
+                &mut canvas,
+                0.0,
+                0.0,
+                ctx.text,
+                None,
+                Some(&mut self.chrome.hit_test_map),
+                id,
+            );
+        }
 
         // Composite the chrome group (bg fill, titlebar, window controls) UNDER everything painted above.
         self.chrome.flatten_into(target, buf_w, buf_h, None);
@@ -820,6 +844,7 @@ impl FluorApp for TuneApp {
             || hit == self.play_button.hit_id()
             || hit == self.random_button.hit_id()
             || hit == self.ranges_button.hit_id()
+            || hit == self.ring_button.hit_id()
             || self.sliders.iter().any(|s| s.hit_id() == hit)
             || self.lo_sliders.iter().any(|s| s.hit_id() == hit)
             || self.hi_sliders.iter().any(|s| s.hit_id() == hit)

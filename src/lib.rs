@@ -397,6 +397,9 @@ fn material_ratio(material: f64, k: usize) -> f64 {
 /// The chime chord: strictly sus4 (1 : 4/3 : 3/2) — no third, unresolved, attention-getting; the PA/transit-chime family. Beats least against casting jitter of the just triads.
 const CHORD: [f64; 3] = [1.0, 4.0 / 3.0, 1.5];
 
+/// The call-ring tremolo rate: full-depth sine on the dry voice, zeroing every 1/9 s — the phrase's articulation (Nick 2026-09-03).
+const RING_TREMOLO_HZ: f64 = 4.5;
+
 /// Build one bell's mode set at fundamental `f0`.
 /// `jitter` scales the per-partial randomness (the chime's `spread`: 0 = exact casting, 1 = full individuality).
 /// `prefix` namespaces this bell's channels (e.g. "bell0 "), so the three castings draw independent jitters from one digest.
@@ -494,10 +497,7 @@ impl Chirp {
         Self::chime_scheduled(p, c, digest, &[(0.0, 1.0)], 1.1)
     }
 
-    /// The ring: the SAME identity voice as [`from_hash`] — same ear-locked ranges, same castings,
-    /// same room — but struck in a call phrase instead of once: two three-hit bursts ("ring-ring"),
-    /// every hit's onset and level jittered a few percent by its own named channel, all sounding
-    /// into ONE shared post chain. One distinct block, not a chirp layered over anything.
+    /// The ring: the SAME identity voice as [`from_hash`] — same ear-locked ranges, same castings, same room — but struck in a call phrase instead of once: two single strikes ("ring-ring"), each rung ~9× the whir hits' length and articulated by a full-depth 4.5 Hz sine tremolo (dips to zero every ninth-second, 4 inverted lobes per second), all sounding into ONE shared post chain. One distinct block, not a chirp layered over anything.
     ///
     /// The clip is one cadence; the caller loops it (with silence between repeats if desired)
     /// until the call is answered. Same digest → same ring, and it audibly IS the contact whose
@@ -542,28 +542,14 @@ impl Chirp {
             ring: r("ring", 0.22, 0.77),
         };
 
-        // The phrase: 2 bursts × 9 hits — same burst span as the original 3-hit take, tripled
-        // density (a whir rather than a knock). Step and burst gap are digest-drawn once; each hit
-        // then nudges its own onset (±12% of the step) and level (±8%, fading slightly across the
-        // burst) thru named channels — deliberate rhythm, human execution.
-        let step = (0.145 + channel_unit("ring step", &hash) * 0.05) / 3.0;
+        // The phrase (Nick 2026-09-03): 2 bursts × ONE hit — the 9-hit whir replaced by a single strike rung 9× longer (τ×3 vs the whir's τ/3), no hit envelope beyond a full-depth sine tremolo at RING_TREMOLO_HZ.
+        // Over each second of ring the tremolo dips the voice to zero every ninth-second (10 zeros counting both ends) and swings thru 4 inverted lobes — the "ring-ring" articulation now lives in the tremolo, not in hit count.
+        // The tremolo LFO is global from clip t = 0, so burst 2's onset snaps to the zero lattice (k/9 s) and both bursts open and close at silence.
         let burst_gap = 0.40 + channel_unit("ring burst gap", &hash) * 0.18;
-        let mut hits = Vec::with_capacity(18);
-        let mut t = 0.0;
-        for b in 0..2 {
-            for i in 0..9 {
-                let dj = channel(&format!("ring b{b} h{i} delay"), &hash) * step * 0.12 * variation;
-                let lj = channel(&format!("ring b{b} h{i} level"), &hash) * 0.08 * variation;
-                let fade = 1.0 - i as f64 / 9.0 * 0.24;
-                hits.push(((t + dj).max(0.0), fade * (1.0 + lj)));
-                t += step;
-            }
-            t += burst_gap;
-        }
-        // Hit envelopes at τ/3 — the auditioned sweet spot (2026-08-29): articulate strikes at whir
-        // density, the shared room supplying the sustain. 1/2 stacked, 1/4 went dry.
-        Self::chime_scheduled_var(bell, chime, &hash, &hits, 3.2, variation, 1.0 / 3.0)
-            .with_post(post, &hash)
+        let second_onset = 1.0 + ((burst_gap * RING_TREMOLO_HZ * 2.0).round() / (RING_TREMOLO_HZ * 2.0));
+        let hits = [(0.0, 1.0), (second_onset, 1.0)];
+        Self::chime_scheduled_var(bell, chime, &hash, &hits, 3.2, variation, 3.0)
+            .with_post_lfo(post, &hash, Some(RING_TREMOLO_HZ))
     }
 
     /// Strike the whole three-bell chime once per `(onset_secs, level)` schedule entry, all into one
@@ -697,7 +683,12 @@ impl Chirp {
 
     /// Install the deterministic post chain (resonators + echo + reverb) and extend the clip so the room tail rings out instead of being chopped at the dry end.
     /// `digest` jitters the comb/echo delays (named channels) so distinct digests get audibly distinct rooms; equal (params, digest) is bit-identical.
-    pub fn with_post(mut self, params: PostParams, digest: &[u8; 32]) -> Self {
+    pub fn with_post(self, params: PostParams, digest: &[u8; 32]) -> Self {
+        self.with_post_lfo(params, digest, None)
+    }
+
+    /// [`with_post`] with the dry-voice LFO overridable: `Some(hz)` = full-depth tremolo at exactly `hz` (the call ring's cadence), replacing the digest-drawn metallic warble; `None` = the warble as always.
+    fn with_post_lfo(mut self, params: PostParams, digest: &[u8; 32], lfo: Option<f64>) -> Self {
         // Tail length scales with how live the room is, capped at ~0.9 s so dry + tail stays inside 2 s total.
         let tail_secs = (0.15
             + params.wet * (0.5 + params.room * 1.2)
@@ -706,9 +697,17 @@ impl Chirp {
             .min(0.9);
         self.total_samples = self.dry_samples + (SAMPLE_RATE_HZ as f64 * tail_secs) as u32;
         self.post = Some(Post::new(params, digest, self.res_freqs));
-        self.ring_depth = params.ring.clamp(0.0, 1.0);
-        // Carrier 40..226 Hz, exp-mapped and seed-drawn: low enough to read as metallic sidebands, not pitch.
-        self.ring_freq = 40.0 * 2f64.powf(channel_unit("ring freq", digest) * 2.5);
+        match lfo {
+            Some(hz) => {
+                self.ring_depth = 1.0;
+                self.ring_freq = hz;
+            }
+            None => {
+                self.ring_depth = params.ring.clamp(0.0, 1.0);
+                // Carrier 40..226 Hz, exp-mapped and seed-drawn: low enough to read as metallic sidebands, not pitch.
+                self.ring_freq = 40.0 * 2f64.powf(channel_unit("ring freq", digest) * 2.5);
+            }
+        }
         self.finalize()
     }
 

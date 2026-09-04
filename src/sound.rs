@@ -1,8 +1,6 @@
 // ── Ring prototype playground: tweak the seed text or ring_from_hash in lib.rs, then `cargo run --bin chirp`. ──
 //
-// Renders `Chirp::ring_from_hash` — the identity voice struck in a "ring-ring" call phrase
-// (2 bursts × 3 jittered hits into one shared room, one distinct block) — looped three times
-// with a gap, the way an incoming call would repeat it until answered.
+// Renders `Chirp::ring_from_hash` — the identity voice struck in a "ring-ring" call phrase (2 single strikes rung long under a full-depth 4.5 Hz tremolo, one shared room) — looped three times with a gap, the way an incoming call would repeat it until answered.
 
 pub const SAMPLE_RATE: u32 = 44100;
 
