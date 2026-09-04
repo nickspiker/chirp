@@ -352,7 +352,17 @@ impl TuneApp {
     /// ☎ (or `r`): audition the current digest's production RING — no reroll, so ding and ring A/B the SAME identity (only ⚄ changes the input). Sliders are ignored; the ring derives every knob from the digest exactly as a real caller's does.
     /// The buffer is fresh here, so dirty goes FALSE — render() must plot THIS, not rebuild the slider chime over it (the bug the first cut shipped).
     fn audition_ring(&mut self, ctx: &mut Context) {
-        self.samples = chirp::Chirp::ring_from_hash(self.digest).collect();
+        // Three cadences with the caller's repeat gap between them — the rhythm is the thing being judged, and one doublet in isolation doesn't show it.
+        let cadence: Vec<f32> = chirp::Chirp::ring_from_hash(self.digest).collect();
+        let gap = (chirp::RING_REPEAT_GAP_SECS * 44_100.0) as usize;
+        let mut out = Vec::with_capacity(cadence.len() * 3 + gap * 2);
+        for k in 0..3 {
+            if k > 0 {
+                out.extend(std::iter::repeat(0.0).take(gap));
+            }
+            out.extend_from_slice(&cadence);
+        }
+        self.samples = out;
         self.samples_dirty = false;
         self.play();
         ctx.window.request_redraw();

@@ -406,8 +406,12 @@ fn material_ratio(material: f64, k: usize) -> f64 {
 /// The chime chord: strictly sus4 (1 : 4/3 : 3/2) — no third, unresolved, attention-getting; the PA/transit-chime family. Beats least against casting jitter of the just triads.
 const CHORD: [f64; 3] = [1.0, 4.0 / 3.0, 1.5];
 
-/// The held ring's cadence length in seconds; the caller loops it.
+/// One ring BURST: the held tone under its sine³ arc.
 const RING_SECS: f64 = 0.5;
+/// The doublet's inner gap — silence between the two bursts of one "ring-ring". Kept well under [`RING_REPEAT_GAP_SECS`] so the pair groups as ONE event (the British double-ring's cue).
+const RING_GAP_SECS: f64 = 0.25;
+/// Silence the CALLER leaves between cadences when looping the ring until answer. Not part of the clip — a rendered 2 s of zeros would bloat every FCM-wake WAV.
+pub const RING_REPEAT_GAP_SECS: f64 = 2.0;
 /// The ring's articulation: one sine arc of this many half-cycles (phase 0 → 9π) across the clip — 10 zeros counting the ends, 9 lobes, 4 of them inverted (Nick 2026-09-03).
 const RING_HALF_CYCLES: f64 = 9.0;
 
@@ -569,6 +573,13 @@ impl Chirp {
                 }
             }
         }
+        // The doublet: burst, inner gap, the SAME burst again — one "ring-ring" event. The trailing repeat gap is the caller's (see RING_REPEAT_GAP_SECS).
+        let burst = ring.rendered.clone();
+        let gap = (SAMPLE_RATE_HZ as f64 * RING_GAP_SECS) as usize;
+        ring.rendered.reserve(gap + burst.len());
+        ring.rendered.extend(std::iter::repeat(0.0).take(gap));
+        ring.rendered.extend_from_slice(&burst);
+        ring.total_samples = ring.rendered.len() as u32;
         ring
     }
 
