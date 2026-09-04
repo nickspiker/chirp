@@ -407,7 +407,7 @@ fn material_ratio(material: f64, k: usize) -> f64 {
 const CHORD: [f64; 3] = [1.0, 4.0 / 3.0, 1.5];
 
 /// The held ring's cadence length in seconds; the caller loops it.
-const RING_SECS: f64 = 2.0;
+const RING_SECS: f64 = 1.0;
 /// The ring's articulation: one sine arc of this many half-cycles (phase 0 → 9π) across the clip — 10 zeros counting the ends, 9 lobes, 4 of them inverted (Nick 2026-09-03).
 const RING_HALF_CYCLES: f64 = 9.0;
 
