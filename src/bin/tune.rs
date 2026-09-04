@@ -136,7 +136,7 @@ impl TuneApp {
             lo_sliders.push(Slider::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, RANGES[i].0));
             hi_sliders.push(Slider::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, RANGES[i].1));
         }
-        let play_button   = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "▶ play");
+        let play_button   = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "♪ ding");
         let random_button = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "⚄ random");
         let ranges_button = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "⎙ ranges");
         let ring_button   = Button::new(&mut hit_counter, 0.0, 0.0, 1.0, 1.0, 14.0, "☎ ring");
@@ -335,29 +335,32 @@ impl TuneApp {
                 self.sliders[i].set_value(v);
             }
             self.poll_slider_changes();
-            // Audition immediately — no separate play press per roll.
-            self.rebuild_samples();
-            self.play();
-            ctx.window.request_redraw();
+            // ⚄ is the ONE input changer: knobs roll inside their zones AND the identity digest rerolls, then the new rando's ding auditions immediately — ♪/☎ then A/B that same identity.
+            self.digest = *blake3::hash(&self.digest).as_bytes();
+            let hex: String = self.digest.iter().map(|b| format!("{b:02x}")).collect();
+            println!("digest: {hex}");
+            self.audition_ding(ctx);
         }
         if self.play_button.take_click() {
-            if self.samples_dirty {
-                self.rebuild_samples();
-            }
-            self.play();
+            self.audition_ding(ctx);
         }
         if self.ring_button.take_click() {
             self.audition_ring(ctx);
         }
     }
 
-    /// ☎ (or `r`): roll a fresh digest and audition its production RING — sliders are ignored, the ring derives every knob from the digest exactly as a real caller's identity does. Each press is a new rando; the digest prints for reproducibility.
+    /// ☎ (or `r`): audition the current digest's production RING — no reroll, so ding and ring A/B the SAME identity (only ⚄ changes the input). Sliders are ignored; the ring derives every knob from the digest exactly as a real caller's does.
     fn audition_ring(&mut self, ctx: &mut Context) {
-        self.digest = *blake3::hash(&self.digest).as_bytes();
         self.samples = chirp::Chirp::ring_from_hash(self.digest).collect();
         self.samples_dirty = true;
-        let hex: String = self.digest.iter().map(|b| format!("{b:02x}")).collect();
-        println!("ring digest: {hex}");
+        self.play();
+        ctx.window.request_redraw();
+    }
+
+    /// ♪ (or `d`): audition the current digest's production DING (`from_hash`) — the ring's sibling voice, same identity, for the correlate-by-ear comparison. No reroll here either.
+    fn audition_ding(&mut self, ctx: &mut Context) {
+        self.samples = chirp::Chirp::from_hash(self.digest).collect();
+        self.samples_dirty = true;
         self.play();
         ctx.window.request_redraw();
     }
@@ -400,9 +403,13 @@ impl TuneApp {
         }
         // `n` = reroll the jitter digest: same knobs, sibling instrument.
         if let Key::Character(c) = &kev.logical_key {
-            // `r` = roll a rando and audition its ring (mirrors the ☎ button).
+            // `r` = audition the current digest's ring (mirrors ☎); `d` = its ding (mirrors ♪). Neither rerolls — ⚄ owns the input.
             if c.eq_ignore_ascii_case("r") {
                 self.audition_ring(ctx);
+                return EventResponse::Handled;
+            }
+            if c.eq_ignore_ascii_case("d") {
+                self.audition_ding(ctx);
                 return EventResponse::Handled;
             }
             if c.eq_ignore_ascii_case("n") {
