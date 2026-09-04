@@ -265,6 +265,8 @@ impl Post {
 /// One struck bell within the chime: its modes, its hammer, and when it gets hit.
 #[derive(Clone)]
 struct Strike {
+    /// HELD, not struck (the call ring): every partial sounds at constant level — no decay envelope, no saw gate. The strike transients (clank/blip) are zeroed by the ring's param derivation, not here.
+    held: bool,
     /// Strike time in seconds from clip start.
     offset: f64,
     partials: Vec<Partial>,
@@ -296,13 +298,17 @@ impl Strike {
         for q in &self.partials {
             // Envelope: (x-1)²·√(1-(x-1)²) over x ∈ 0..1, x = t normalized to this mode's lifetime (4τ, so higher modes still die first).
             // Zero at BOTH ends (no exponential tail, no click), peak 2/(3√3) at x ≈ 0.184, scaled to unity.
-            let x = t / (q.tau * 4.0);
-            if x >= 1.0 {
-                continue;
-            }
-            let u = x - 1.0;
-            let u2 = u * u;
-            let env = u2 * (1.0 - u2).max(0.0).sqrt() * 2.598_076_211_353_316;
+            let env = if self.held {
+                1.0
+            } else {
+                let x = t / (q.tau * 4.0);
+                if x >= 1.0 {
+                    continue;
+                }
+                let u = x - 1.0;
+                let u2 = u * u;
+                u2 * (1.0 - u2).max(0.0).sqrt() * 2.598_076_211_353_316
+            };
             // Alias guard: FM sidebands extend the partial's bandwidth, so the depth fades back toward pure sine as the partial climbs.
             let beta = self.fm * 2.5 * (3000.0 / q.freq).min(1.0);
             let theta = std::f64::consts::TAU * q.freq * t;
@@ -339,6 +345,9 @@ impl Strike {
         // Per-bell sawtooth gate, x ∈ 0..1 over THIS bell's sounding life (the formula's own +1 shifts the exponent to 4..8):
         // (tanh(sin(2^((x·(1+r0/4) + 1 + r1/16)·4))·4 + r2·2) + 1)/2
         // sin of an exponentially growing phase = accelerating gate cycles; ×4 into tanh saturates them square (digital chop); r2 biases the duty toward open or shut.
+        if self.held {
+            return acc * self.level;
+        }
         let [s0, s1, s2] = self.saw;
         let x = t / self.saw_life;
         let phase = 2.0f64.powf((x * (1.0 + s0 * 0.25) + 1.0 + s1 * 0.0625) * 4.0);
@@ -397,8 +406,8 @@ fn material_ratio(material: f64, k: usize) -> f64 {
 /// The chime chord: strictly sus4 (1 : 4/3 : 3/2) — no third, unresolved, attention-getting; the PA/transit-chime family. Beats least against casting jitter of the just triads.
 const CHORD: [f64; 3] = [1.0, 4.0 / 3.0, 1.5];
 
-/// The call-ring tremolo: one sine arc of this many half-cycles (0 → 9π) across the finished ding clip — 10 zeros counting the ends, 4 inverted lobes (Nick 2026-09-03).
-const RING_HALF_CYCLES: f64 = 9.0;
+/// The held ring's cadence length in seconds — flat constant level end to end; the caller loops it.
+const RING_SECS: f64 = 2.0;
 
 /// Build one bell's mode set at fundamental `f0`.
 /// `jitter` scales the per-partial randomness (the chime's `spread`: 0 = exact casting, 1 = full individuality).
@@ -497,33 +506,49 @@ impl Chirp {
         Self::chime_scheduled(p, c, digest, &[(0.0, 1.0)], 1.1)
     }
 
-    /// The ring: the ding itself — the bit-identical [`from_hash`] render, post chain and all —
-    /// multiplied by ONE sine arc spanning the whole clip, phase 0 → 9π (Nick 2026-09-03). It opens
-    /// and closes on a zero, dips to silence 10 times counting the ends, and inverts thru 4 of its
-    /// 9 lobes. No phrase schedule, no envelope of its own; the tremolo IS the articulation.
+    /// The ring: the SAME instrument as [`from_hash`] — identical digest-derived castings — but HELD
+    /// instead of struck (Nick 2026-09-03): every partial sounds at constant level for the whole clip.
+    /// No decay envelope, no saw gate, no hammer transients, no room — a flat, consistent volume
+    /// from first sample to last. The articulation layer (the 0 → 9π sine arc) comes back on top
+    /// of this once the base is right.
     ///
     /// The clip is one cadence; the caller loops it (with silence between repeats if desired)
     /// until the call is answered. Same digest → same ring, and it audibly IS the contact whose
-    /// messages chirp — just conjugated from "ding" into "answer me".
+    /// messages chirp — the ding's chord, held.
     pub fn ring_from_hash(hash: [u8; 32]) -> Self {
-        let mut ring = Self::from_hash(hash);
-        let n = ring.rendered.len();
-        if n > 1 {
-            let mut peak = 0.0f32;
-            for (i, s) in ring.rendered.iter_mut().enumerate() {
-                let phase = std::f64::consts::PI * RING_HALF_CYCLES * i as f64 / (n - 1) as f64;
-                *s *= phase.sin() as f32;
-                peak = peak.max(s.abs());
-            }
-            // Re-normalize: the tremolo shaved the peak unless it happened to land mid-lobe.
-            if peak > 0.0 {
-                let g = 1.0 / peak;
-                for s in &mut ring.rendered {
-                    *s *= g;
-                }
+        // Identical parameter derivation to from_hash — keep the ranges in lockstep — minus the strike transients (a held tone has no hammer).
+        let r = |name: &str, lo: f64, hi: f64| lo + channel_unit(name, &hash) * (hi - lo);
+        let bell = BellParams {
+            pitch: r("pitch", 0.42, 0.90),
+            material: r("material", 0.56, 0.79),
+            decay: r("decay", 0.10, 0.49),
+            slope: r("slope", 0.0, 1.0),
+            strike: r("strike", 0.0, 1.0),
+            inharm: r("inharm", 0.45, 0.95),
+            shimmer: r("shimmer", 0.0, 1.0),
+            partials: r("partials", 0.0, 1.0),
+            clank: 0.0,
+            hum: r("hum", 0.0, 1.0),
+            fm: r("fm", 0.40, 0.80),
+            blip: 0.0,
+        };
+        let chime = ChimeParams {
+            spacing: r("chime spacing", 0.0, 1.0),
+            spread: r("chime spread", 0.0, 1.0),
+            arp: r("chime arp", 0.0, 0.60),
+        };
+        let mut ring = Self::from_chime(bell, chime, &hash);
+        // Hold every strike: constant level, full length, dry (the room's echo/warble would put level motion back).
+        // Detune twins zeroed too: shimmer's beating pairs are slow amplitude interference — audible level motion on a held tone (measured up to 1 stop of RMS wobble).
+        for st in &mut ring.strikes {
+            st.held = true;
+            for q in &mut st.partials {
+                q.det = 0.0;
             }
         }
-        ring
+        ring.total_samples = (SAMPLE_RATE_HZ as f64 * RING_SECS) as u32;
+        ring.dry_samples = ring.total_samples;
+        ring.finalize()
     }
 
     /// Strike the whole three-bell chime once per `(onset_secs, level)` schedule entry, all into one
@@ -597,6 +622,7 @@ impl Chirp {
                 // Arp morphs the scatter draw toward a deliberate ascending ladder (45 ms steps).
                 let scatter = channel(&format!("{bp}{hs}offset"), digest) * window;
                 strikes.push(Strike {
+                    held: false,
                     offset: onset + scatter * (1.0 - arp) + k as f64 * 0.045 * arp,
                     partials: hit_partials,
                     level: level * hit_level,
