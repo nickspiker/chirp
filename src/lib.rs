@@ -397,8 +397,8 @@ fn material_ratio(material: f64, k: usize) -> f64 {
 /// The chime chord: strictly sus4 (1 : 4/3 : 3/2) — no third, unresolved, attention-getting; the PA/transit-chime family. Beats least against casting jitter of the just triads.
 const CHORD: [f64; 3] = [1.0, 4.0 / 3.0, 1.5];
 
-/// The call-ring tremolo rate: full-depth sine on the dry voice, zeroing every 1/9 s — the phrase's articulation (Nick 2026-09-03).
-const RING_TREMOLO_HZ: f64 = 4.5;
+/// The call-ring tremolo: one sine arc of this many half-cycles (0 → 9π) across the finished ding clip — 10 zeros counting the ends, 4 inverted lobes (Nick 2026-09-03).
+const RING_HALF_CYCLES: f64 = 9.0;
 
 /// Build one bell's mode set at fundamental `f0`.
 /// `jitter` scales the per-partial randomness (the chime's `spread`: 0 = exact casting, 1 = full individuality).
@@ -497,59 +497,33 @@ impl Chirp {
         Self::chime_scheduled(p, c, digest, &[(0.0, 1.0)], 1.1)
     }
 
-    /// The ring: the SAME identity voice as [`from_hash`] — same ear-locked ranges, same castings, same room — but struck in a call phrase instead of once: two single strikes ("ring-ring"), each rung ~9× the whir hits' length and articulated by a full-depth 4.5 Hz sine tremolo (dips to zero every ninth-second, 4 inverted lobes per second), all sounding into ONE shared post chain. One distinct block, not a chirp layered over anything.
+    /// The ring: the ding itself — the bit-identical [`from_hash`] render, post chain and all —
+    /// multiplied by ONE sine arc spanning the whole clip, phase 0 → 9π (Nick 2026-09-03). It opens
+    /// and closes on a zero, dips to silence 10 times counting the ends, and inverts thru 4 of its
+    /// 9 lobes. No phrase schedule, no envelope of its own; the tremolo IS the articulation.
     ///
     /// The clip is one cadence; the caller loops it (with silence between repeats if desired)
     /// until the call is answered. Same digest → same ring, and it audibly IS the contact whose
     /// messages chirp — just conjugated from "ding" into "answer me".
     pub fn ring_from_hash(hash: [u8; 32]) -> Self {
-        Self::ring_with_variation(hash, 1.0)
-    }
-
-    /// [`ring_from_hash`] with the per-hit smidgle exposed: `variation` scales how much each hit's
-    /// casting is re-rolled (partial freq/tau/amp nudges thru per-hit channels). 0 = every hit is the
-    /// identical casting (machine repeat); 1 = the production smidgle; >1 exaggerated, for auditioning.
-    pub fn ring_with_variation(hash: [u8; 32], variation: f64) -> Self {
-        // Identical parameter derivation to from_hash — the ring must be the same instrument —
-        // minus the supporting sounds: no hammer clank, no zap blip (18 of either is a mess).
-        let r = |name: &str, lo: f64, hi: f64| lo + channel_unit(name, &hash) * (hi - lo);
-        let bell = BellParams {
-            pitch: r("pitch", 0.42, 0.90),
-            material: r("material", 0.56, 0.79),
-            decay: r("decay", 0.10, 0.49),
-            slope: r("slope", 0.0, 1.0),
-            strike: r("strike", 0.0, 1.0),
-            inharm: r("inharm", 0.45, 0.95),
-            shimmer: r("shimmer", 0.0, 1.0),
-            partials: r("partials", 0.0, 1.0),
-            clank: 0.0,
-            hum: r("hum", 0.0, 1.0),
-            fm: r("fm", 0.40, 0.80),
-            blip: 0.0,
-        };
-        let chime = ChimeParams {
-            spacing: r("chime spacing", 0.0, 1.0),
-            spread: r("chime spread", 0.0, 1.0),
-            arp: r("chime arp", 0.0, 0.60),
-        };
-        let post = PostParams {
-            room: r("room size", 0.05, 0.16),
-            damp: r("room damp", 0.38, 1.0),
-            echo_time: r("echo time", 0.18, 0.45),
-            echo_gain: r("echo gain", 0.21, 0.58),
-            resonance: r("resonance", 0.60, 1.0),
-            wet: r("wet", 0.38, 0.78),
-            ring: r("ring", 0.22, 0.77),
-        };
-
-        // The phrase (Nick 2026-09-03): 2 bursts × ONE hit — the 9-hit whir replaced by a single strike rung 9× longer (τ×3 vs the whir's τ/3), no hit envelope beyond a full-depth sine tremolo at RING_TREMOLO_HZ.
-        // Over each second of ring the tremolo dips the voice to zero every ninth-second (10 zeros counting both ends) and swings thru 4 inverted lobes — the "ring-ring" articulation now lives in the tremolo, not in hit count.
-        // The tremolo LFO is global from clip t = 0, so burst 2's onset snaps to the zero lattice (k/9 s) and both bursts open and close at silence.
-        let burst_gap = 0.40 + channel_unit("ring burst gap", &hash) * 0.18;
-        let second_onset = 1.0 + ((burst_gap * RING_TREMOLO_HZ * 2.0).round() / (RING_TREMOLO_HZ * 2.0));
-        let hits = [(0.0, 1.0), (second_onset, 1.0)];
-        Self::chime_scheduled_var(bell, chime, &hash, &hits, 3.2, variation, 3.0)
-            .with_post_lfo(post, &hash, Some(RING_TREMOLO_HZ))
+        let mut ring = Self::from_hash(hash);
+        let n = ring.rendered.len();
+        if n > 1 {
+            let mut peak = 0.0f32;
+            for (i, s) in ring.rendered.iter_mut().enumerate() {
+                let phase = std::f64::consts::PI * RING_HALF_CYCLES * i as f64 / (n - 1) as f64;
+                *s *= phase.sin() as f32;
+                peak = peak.max(s.abs());
+            }
+            // Re-normalize: the tremolo shaved the peak unless it happened to land mid-lobe.
+            if peak > 0.0 {
+                let g = 1.0 / peak;
+                for s in &mut ring.rendered {
+                    *s *= g;
+                }
+            }
+        }
+        ring
     }
 
     /// Strike the whole three-bell chime once per `(onset_secs, level)` schedule entry, all into one
@@ -683,12 +657,7 @@ impl Chirp {
 
     /// Install the deterministic post chain (resonators + echo + reverb) and extend the clip so the room tail rings out instead of being chopped at the dry end.
     /// `digest` jitters the comb/echo delays (named channels) so distinct digests get audibly distinct rooms; equal (params, digest) is bit-identical.
-    pub fn with_post(self, params: PostParams, digest: &[u8; 32]) -> Self {
-        self.with_post_lfo(params, digest, None)
-    }
-
-    /// [`with_post`] with the dry-voice LFO overridable: `Some(hz)` = full-depth tremolo at exactly `hz` (the call ring's cadence), replacing the digest-drawn metallic warble; `None` = the warble as always.
-    fn with_post_lfo(mut self, params: PostParams, digest: &[u8; 32], lfo: Option<f64>) -> Self {
+    pub fn with_post(mut self, params: PostParams, digest: &[u8; 32]) -> Self {
         // Tail length scales with how live the room is, capped at ~0.9 s so dry + tail stays inside 2 s total.
         let tail_secs = (0.15
             + params.wet * (0.5 + params.room * 1.2)
@@ -697,17 +666,9 @@ impl Chirp {
             .min(0.9);
         self.total_samples = self.dry_samples + (SAMPLE_RATE_HZ as f64 * tail_secs) as u32;
         self.post = Some(Post::new(params, digest, self.res_freqs));
-        match lfo {
-            Some(hz) => {
-                self.ring_depth = 1.0;
-                self.ring_freq = hz;
-            }
-            None => {
-                self.ring_depth = params.ring.clamp(0.0, 1.0);
-                // Carrier 40..226 Hz, exp-mapped and seed-drawn: low enough to read as metallic sidebands, not pitch.
-                self.ring_freq = 40.0 * 2f64.powf(channel_unit("ring freq", digest) * 2.5);
-            }
-        }
+        self.ring_depth = params.ring.clamp(0.0, 1.0);
+        // Carrier 40..226 Hz, exp-mapped and seed-drawn: low enough to read as metallic sidebands, not pitch.
+        self.ring_freq = 40.0 * 2f64.powf(channel_unit("ring freq", digest) * 2.5);
         self.finalize()
     }
 
