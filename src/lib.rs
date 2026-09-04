@@ -406,8 +406,10 @@ fn material_ratio(material: f64, k: usize) -> f64 {
 /// The chime chord: strictly sus4 (1 : 4/3 : 3/2) — no third, unresolved, attention-getting; the PA/transit-chime family. Beats least against casting jitter of the just triads.
 const CHORD: [f64; 3] = [1.0, 4.0 / 3.0, 1.5];
 
-/// The held ring's cadence length in seconds — flat constant level end to end; the caller loops it.
+/// The held ring's cadence length in seconds; the caller loops it.
 const RING_SECS: f64 = 2.0;
+/// The ring's articulation: one sine arc of this many half-cycles (phase 0 → 9π) across the clip — 10 zeros counting the ends, 9 lobes, 4 of them inverted (Nick 2026-09-03).
+const RING_HALF_CYCLES: f64 = 9.0;
 
 /// Build one bell's mode set at fundamental `f0`.
 /// `jitter` scales the per-partial randomness (the chime's `spread`: 0 = exact casting, 1 = full individuality).
@@ -507,10 +509,10 @@ impl Chirp {
     }
 
     /// The ring: the SAME instrument as [`from_hash`] — identical digest-derived castings — but HELD
-    /// instead of struck (Nick 2026-09-03): every partial sounds at constant level for the whole clip.
-    /// No decay envelope, no saw gate, no hammer transients, no room — a flat, consistent volume
-    /// from first sample to last. The articulation layer (the 0 → 9π sine arc) comes back on top
-    /// of this once the base is right.
+    /// instead of struck (Nick 2026-09-03): every partial sounds at constant level, no decay envelope,
+    /// no saw gate, no hammer transients, no room. The ONLY articulation is one sine arc multiplied
+    /// over the flat tone, phase 0 → 9π across the clip: it opens and closes on a zero, dips to
+    /// silence 10 times counting the ends, and 4 of its 9 lobes are polarity-inverted.
     ///
     /// The clip is one cadence; the caller loops it (with silence between repeats if desired)
     /// until the call is answered. Same digest → same ring, and it audibly IS the contact whose
@@ -548,7 +550,24 @@ impl Chirp {
         }
         ring.total_samples = (SAMPLE_RATE_HZ as f64 * RING_SECS) as u32;
         ring.dry_samples = ring.total_samples;
-        ring.finalize()
+        let mut ring = ring.finalize();
+        // The articulation: the flat tone × sin(0 → 9π), then re-normalize the shaved peak.
+        let n = ring.rendered.len();
+        if n > 1 {
+            let mut peak = 0.0f32;
+            for (i, v) in ring.rendered.iter_mut().enumerate() {
+                let phase = std::f64::consts::PI * RING_HALF_CYCLES * i as f64 / (n - 1) as f64;
+                *v *= phase.sin() as f32;
+                peak = peak.max(v.abs());
+            }
+            if peak > 0.0 {
+                let g = 1.0 / peak;
+                for v in &mut ring.rendered {
+                    *v *= g;
+                }
+            }
+        }
+        ring
     }
 
     /// Strike the whole three-bell chime once per `(onset_secs, level)` schedule entry, all into one
