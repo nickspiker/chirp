@@ -513,6 +513,30 @@ impl Chirp {
         Self::chime_scheduled(p, c, digest, &[(0.0, 1.0)], 1.1)
     }
 
+    /// The identity casting made visible: the ROOT bell's partials as `(freq ratio to f0, amp normalized to the loudest)`, derived exactly as [`from_hash`] derives them (same digest channels, same spread jitter). Exported for visual siblings — photon's ring-rim contour maps this spectrum to angular harmonics, so the shape on screen and the sound in the room come from one casting.
+    pub fn casting_from_hash(hash: [u8; 32]) -> Vec<(f64, f64)> {
+        let r = |name: &str, lo: f64, hi: f64| lo + channel_unit(name, &hash) * (hi - lo);
+        let bell = BellParams {
+            pitch: r("pitch", 0.42, 0.90),
+            material: r("material", 0.56, 0.79),
+            decay: r("decay", 0.10, 0.49),
+            slope: r("slope", 0.0, 1.0),
+            strike: r("strike", 0.0, 1.0),
+            inharm: r("inharm", 0.45, 0.95),
+            shimmer: r("shimmer", 0.0, 1.0),
+            partials: r("partials", 0.0, 1.0),
+            clank: 0.0,
+            hum: r("hum", 0.0, 1.0),
+            fm: r("fm", 0.40, 0.80),
+            blip: 0.0,
+        };
+        let spread = r("chime spread", 0.0, 1.0);
+        let f_root = 1024.0 * 2.0f64.powf(bell.pitch.clamp(0.0, 1.0));
+        let partials = build_partials(&bell, f_root, "bell0 ", &hash, spread);
+        let peak = partials.iter().map(|q| q.amp).fold(0.0f64, f64::max).max(1e-9);
+        partials.iter().map(|q| (q.freq / f_root, q.amp / peak)).collect()
+    }
+
     /// The ring: the SAME instrument as [`from_hash`] — identical digest-derived castings — but HELD
     /// instead of struck (Nick 2026-09-03): every partial sounds at constant level, no decay envelope,
     /// no saw gate, no hammer transients, no room. The ONLY articulation is one sine arc multiplied
