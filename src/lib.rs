@@ -28,7 +28,8 @@ use std::time::Duration;
 #[cfg(feature = "playback")]
 use rodio::{ChannelCount, SampleRate, Source};
 
-const SAMPLE_RATE_HZ: u32 = 44_100;
+/// The rate every clip is synthesized at — public so callers resampling into another pipeline (photon's 48 kHz call path) read it instead of hardcoding.
+pub const SAMPLE_RATE_HZ: u32 = 44_100;
 
 /// Maximum partial count (the `partials` knob selects 3..=10 of these).
 pub const MAX_PARTIALS: usize = 10;
