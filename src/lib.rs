@@ -512,7 +512,9 @@ impl Chirp {
     /// instead of struck (Nick 2026-09-03): every partial sounds at constant level, no decay envelope,
     /// no saw gate, no hammer transients, no room. The ONLY articulation is one sine arc multiplied
     /// over the flat tone, phase 0 → 9π across the clip: it opens and closes on a zero, dips to
-    /// silence 10 times counting the ends, and 4 of its 9 lobes are polarity-inverted.
+    /// silence 10 times counting the ends, and 4 of its 9 lobes are polarity-inverted. The sine is
+    /// CUBED before multiplying (Nick 2026-09-03): same zeros, same signs, but the lobes narrow and
+    /// the dips widen — a breathier, more articulated pulse than the bare arc.
     ///
     /// The clip is one cadence; the caller loops it (with silence between repeats if desired)
     /// until the call is answered. Same digest → same ring, and it audibly IS the contact whose
@@ -551,13 +553,13 @@ impl Chirp {
         ring.total_samples = (SAMPLE_RATE_HZ as f64 * RING_SECS) as u32;
         ring.dry_samples = ring.total_samples;
         let mut ring = ring.finalize();
-        // The articulation: the flat tone × sin(0 → 9π), then re-normalize the shaved peak.
+        // The articulation: the flat tone × sin³(0 → 9π) — cubed: zeros and signs unchanged, lobes narrowed, dips widened — then re-normalize the shaved peak.
         let n = ring.rendered.len();
         if n > 1 {
             let mut peak = 0.0f32;
             for (i, v) in ring.rendered.iter_mut().enumerate() {
                 let phase = std::f64::consts::PI * RING_HALF_CYCLES * i as f64 / (n - 1) as f64;
-                *v *= phase.sin() as f32;
+                *v *= phase.sin().powi(3) as f32;
                 peak = peak.max(v.abs());
             }
             if peak > 0.0 {
