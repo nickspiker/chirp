@@ -944,11 +944,18 @@ impl Chirp {
     /// Play on the default output device, blocking until the clip finishes.
     #[cfg(feature = "playback")]
     pub fn play_blocking(self) -> Result<(), String> {
+        self.play_blocking_at(1.)
+    }
+
+    /// [`Self::play_blocking`] at `gain` of the clip's full scale (a host that wants its alerts quieter than the peak-normalized clip: 1/8 is three stops down).
+    #[cfg(feature = "playback")]
+    pub fn play_blocking_at(self, gain: f32) -> Result<(), String> {
         let mut sink = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| format!("no default audio output device: {e}"))?;
         // Dropping the sink after playback is deliberate; silence rodio's drop warning.
         sink.log_on_drop(false);
         let player = rodio::Player::connect_new(&sink.mixer());
+        player.set_volume(gain);
         player.append(self);
         player.sleep_until_end();
         Ok(())
