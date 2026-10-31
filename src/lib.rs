@@ -549,6 +549,19 @@ impl Chirp {
     /// until the call is answered. Same digest → same ring, and it audibly IS the contact whose
     /// messages chirp — the ding's chord, held.
     pub fn ring_from_hash(hash: [u8; 32]) -> Self {
+        Self::ring_cadence(hash, 2)
+    }
+
+    /// The BEAM's ring (Nick 2026-10-31: "three ring beam, maybe same duration but quicker bursts so the ring duration is the same but it has three chirps"): the same identity tone as [`Self::ring_from_hash`], three bursts in the doublet's span — a wave rings twice, a beam three times, and a listener tells them apart before looking.
+    pub fn beam_ring_from_hash(hash: [u8; 32]) -> Self {
+        Self::ring_cadence(hash, 3)
+    }
+
+    /// One ring cadence of `bursts` bursts. Every cadence spans the doublet's time (2 × RING_SECS + RING_GAP_SECS) with burst and gap in the doublet's 2 : 1 ratio, so more bursts are quicker ones, not a longer ring.
+    fn ring_cadence(hash: [u8; 32], bursts: usize) -> Self {
+        let span = 2.0 * RING_SECS + RING_GAP_SECS;
+        let unit = span / (3 * bursts - 1) as f64;
+        let (burst_secs, gap_secs) = (2.0 * unit, unit);
         // Identical parameter derivation to from_hash — keep the ranges in lockstep — minus the strike transients (a held tone has no hammer).
         let r = |name: &str, lo: f64, hi: f64| lo + channel_unit(name, &hash) * (hi - lo);
         let bell = BellParams {
@@ -579,7 +592,7 @@ impl Chirp {
                 q.det = 0.0;
             }
         }
-        ring.total_samples = (SAMPLE_RATE_HZ as f64 * RING_SECS) as u32;
+        ring.total_samples = (SAMPLE_RATE_HZ as f64 * burst_secs) as u32;
         ring.dry_samples = ring.total_samples;
         let mut ring = ring.finalize();
         // The articulation: the flat tone × sin³(0 → 9π) — cubed: zeros and signs unchanged, lobes narrowed, dips widened — then re-normalize the shaved peak.
@@ -598,12 +611,13 @@ impl Chirp {
                 }
             }
         }
-        // The doublet: burst, inner gap, the SAME burst again — one "ring-ring" event. The trailing repeat gap is the caller's (see RING_REPEAT_GAP_SECS).
+        // The cadence: burst, inner gap, the SAME burst again, as many times as asked — one "ring-ring" (or "ring-ring-ring") event. The trailing repeat gap is the caller's (see RING_REPEAT_GAP_SECS).
         let burst = ring.rendered.clone();
-        let gap = (SAMPLE_RATE_HZ as f64 * RING_GAP_SECS) as usize;
-        ring.rendered.reserve(gap + burst.len());
-        ring.rendered.extend(std::iter::repeat(0.0).take(gap));
-        ring.rendered.extend_from_slice(&burst);
+        let gap = (SAMPLE_RATE_HZ as f64 * gap_secs) as usize;
+        for _ in 1..bursts {
+            ring.rendered.extend(std::iter::repeat(0.0).take(gap));
+            ring.rendered.extend_from_slice(&burst);
+        }
         ring.total_samples = ring.rendered.len() as u32;
         ring
     }
